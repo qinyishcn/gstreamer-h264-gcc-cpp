@@ -16,6 +16,7 @@
 #include <chrono>
 
 #include <gst/gst.h>
+#include "gst_compat.h"
 
 static std::atomic<bool> running{true};
 
@@ -67,7 +68,7 @@ int main(int argc, char* argv[]) {
     // Build pipeline using gst_parse_launch
     GError* error = nullptr;
     gchar* pipeline_str = g_strdup_printf(
-        "videotestsrc is-live=true pattern=ball ! "
+        "videotestsrc is-live=true pattern=ball ! video/x-raw,width=320,height=240,framerate=30/1 ! "
         "videoconvert ! "
         "x264enc tune=zerolatency speed-preset=%s bitrate=%d key-int-max=%d "
         "bframes=0 threads=%d byte-stream=true aud=true rc-lookahead=0 "
@@ -114,7 +115,7 @@ int main(int argc, char* argv[]) {
         if (elapsed >= cfg.duration) break;
 
         // Check for bus errors
-        GstMessage* msg = gst_bus_pop_filtered(bus,
+        GstMessage* msg = gst_compat_bus_pop_filtered(bus,
             (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
 
         if (msg) {

@@ -22,6 +22,7 @@
 #include <cmath>
 
 #include <gst/gst.h>
+#include "gst_compat.h"
 
 #include "gcc_controller.h"
 

@@ -16,6 +16,7 @@
 #include <chrono>
 
 #include <gst/gst.h>
+#include "gst_compat.h"
 
 static std::atomic<bool> running{true};
 
@@ -100,7 +101,7 @@ int main(int argc, char* argv[]) {
         double elapsed = std::chrono::duration<double>(now - start).count();
 
         // Check for errors
-        GstMessage* msg = gst_bus_pop_filtered(bus,
+        GstMessage* msg = gst_compat_bus_pop_filtered(bus,
             (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
 
         if (msg) {
