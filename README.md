@@ -1,6 +1,6 @@
 # H.264 + GCC Video Transmission System (C++ / GStreamer)
 
-基于 GStreamer C API 的 H.264 视频传输系统，集成 Google Congestion Control (GCC) 拥塞控制算法。适配 Ubuntu 20.04 LTS + GStreamer 1.16+（已做跨版本兼容处理）。
+基于 GStreamer C API 的 H.264 视频传输系统，集成 Google Congestion Control (GCC) 拥塞控制算法。已在 GStreamer 1.16.3（Ubuntu 20.04）和 1.28.2（Ubuntu 24.04）上验证通过。
 
 ## 🎯 项目简介
 
@@ -43,7 +43,6 @@ gstreamer-h264-gcc-cpp/
 
 - Ubuntu 20.04 LTS（推荐）/ 其他支持 GStreamer 1.16+ 的 Linux 发行版
 - GStreamer 1.18+ 可获得完整的接收帧统计（fakesink `stats` 属性）；1.16 下帧统计显示为 0 但不影响传输功能
-- H.264 profile 设置方式：1.18+ 通过 caps 协商，1.16 通过 `option-string`（编译期自动选择）
 - CMake 3.10+
 - GCC/G++ 7+
 - GStreamer 1.16.x + 开发库
@@ -144,7 +143,7 @@ printf("State: %d, Bitrate: %d kbps\n", stats.current_state, stats.current_bitra
 videotestsrc → videoconvert → x264enc → h264parse → rtph264pay → udpsink
 ```
 
-通过 `gst_parse_launch()` 构建管线，支持 `--bitrate`、`--preset`、`--host`、`--port` 参数。
+通过逐元素构建管线（`gst_element_factory_make` + `gst_element_link_filtered`），设置 `video/x-h264,profile=caps` 确保 H.264 Baseline Profile。支持 `--bitrate`、`--preset`、`--host`、`--port` 参数。
 
 ### receiver.cpp — GStreamer 视频接收端
 
@@ -205,6 +204,7 @@ udpsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → fakesi
 - ✅ GCC 控制器：稳定→拥塞→恢复 全 cycle
 - ✅ GStreamer 元素：x264enc, avdec_h264, rtpbin, udpsink/src
 - ✅ 集成测试：发送+接收管线，~30fps
+- ✅ 跨版本验证：GStreamer 1.16.3（Docker/Ubuntu 20.04）+ 1.28.2（Ubuntu 24.04）
 
 ## 📚 参考文献
 
