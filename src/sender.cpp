@@ -97,11 +97,12 @@ int main(int argc, char* argv[]) {
         "pattern", 1,  // ball pattern
         nullptr);
 
-    // Configure x264enc
-    // Use string enum values for cross-version compatibility
+    // Configure x264enc (use numeric enum values for cross-version compatibility)
+    // tune: 0x4 = zerolatency (Flags type, can OR multiple values)
+    // speed-preset: 1 = ultrafast
     g_object_set(encoder,
-        "tune",         "zerolatency",
-        "speed-preset", "ultrafast",
+        "tune",         0x4,     // zerolatency
+        "speed-preset", 1,       // ultrafast
         "bitrate",      cfg.bitrate,
         "key-int-max",  cfg.key_int,
         "bframes",      0,
@@ -111,8 +112,8 @@ int main(int argc, char* argv[]) {
         "rc-lookahead", 0,
         nullptr);
 
-    // Set x264 profile via option-string
-    g_object_set(encoder, "option-string", "profile=baseline", nullptr);
+    // Set x264 profile via caps filter (option-string with profile= breaks on GStreamer 1.18+)
+    // Profile is negotiated through caps, not option-string
 
     // Configure h264parse
     g_object_set(parser, "config-interval", -1, nullptr);
@@ -132,13 +133,32 @@ int main(int argc, char* argv[]) {
         "async", FALSE,
         nullptr);
 
-    // Add all elements to pipeline and link
+    // Add all elements to pipeline
     gst_bin_add_many(GST_BIN(pipeline),
         src, convert, encoder, parser, payloader, sink, nullptr);
 
-    // Link: src → convert → encoder → parser → payloader → sink
-    if (!gst_element_link_many(src, convert, encoder, parser, payloader, sink, nullptr)) {
-        fprintf(stderr, "ERROR: Failed to link pipeline elements\n");
+    // Link: src → convert → encoder (basic link)
+    if (!gst_element_link_many(src, convert, encoder, nullptr)) {
+        fprintf(stderr, "ERROR: Failed to link src → convert → encoder\n");
+        gst_object_unref(pipeline);
+        return 1;
+    }
+
+    // Link encoder → parser with caps filter (sets H.264 profile)
+    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
+        "profile", G_TYPE_STRING, "baseline",
+        nullptr);
+    if (!gst_element_link_filtered(encoder, parser, h264_caps)) {
+        fprintf(stderr, "ERROR: Failed to link encoder → parser (profile=caps)\n");
+        gst_caps_unref(h264_caps);
+        gst_object_unref(pipeline);
+        return 1;
+    }
+    gst_caps_unref(h264_caps);
+
+    // Link: parser → payloader → sink
+    if (!gst_element_link_many(parser, payloader, sink, nullptr)) {
+        fprintf(stderr, "ERROR: Failed to link parser → payloader → sink\n");
         gst_object_unref(pipeline);
         return 1;
     }

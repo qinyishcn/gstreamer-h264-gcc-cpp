@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
 
     SimNetwork net;
 
-    // ── Build Receiver Pipeline ──
+    // ── Build Receiver Pipeline (gst_parse_launch is fine — no option-string) ──
     GError* error = nullptr;
     gchar* rx_str = g_strdup_printf(
         "udpsrc port=%d caps=application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 ! "
@@ -133,27 +133,67 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ── Build Sender Pipeline ──
-    gchar* tx_str = g_strdup_printf(
-        "videotestsrc is-live=true pattern=ball ! "
-        "videoconvert ! "
-        "x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d "
-        "key-int-max=60 bframes=0 threads=2 byte-stream=true aud=true rc-lookahead=0 "
-        "option-string=\"profile=baseline\" name=encoder ! "
-        "h264parse config-interval=-1 ! "
-        "rtph264pay pt=96 mtu=1400 config-interval=-1 ! "
-        "udpsink host=%s port=%d sync=false async=false",
-        cfg.bitrate, cfg.host, cfg.rtp_port
-    );
-    GstPipeline* tx_pipeline = GST_PIPELINE(gst_parse_launch(tx_str, &error));
-    g_free(tx_str);
-    if (!tx_pipeline || error) {
-        fprintf(stderr, "ERROR: Sender pipeline: %s\n", error ? error->message : "?");
+    // ── Build Sender Pipeline (element-by-element to avoid option-string bug) ──
+    GstElement *tx_pipeline_raw, *tx_src, *tx_convert, *tx_encoder, *tx_parser, *tx_payloader, *tx_sink;
+
+    tx_pipeline_raw = gst_pipeline_new("tx-pipeline");
+    tx_src       = gst_element_factory_make("videotestsrc",  "tx-video-src");
+    tx_convert   = gst_element_factory_make("videoconvert",  "tx-video-convert");
+    tx_encoder   = gst_element_factory_make("x264enc",       "encoder");
+    tx_parser    = gst_element_factory_make("h264parse",     "tx-h264-parser");
+    tx_payloader = gst_element_factory_make("rtph264pay",    "tx-rtp-payloader");
+    tx_sink      = gst_element_factory_make("udpsink",       "tx-udp-sink");
+
+    if (!tx_pipeline_raw || !tx_src || !tx_convert || !tx_encoder || !tx_parser || !tx_payloader || !tx_sink) {
+        fprintf(stderr, "ERROR: Failed to create sender elements\n");
         gst_object_unref(rx_pipeline);
         return 1;
     }
 
-    GstElement* encoder = gst_bin_get_by_name(GST_BIN(tx_pipeline), "encoder");
+    // Configure elements
+    g_object_set(tx_src, "is-live", TRUE, "pattern", 1, nullptr);  // ball
+    g_object_set(tx_encoder,
+        "tune", 0x4, "speed-preset", 1,  // zerolatency, ultrafast
+        "bitrate", cfg.bitrate, "key-int-max", 60,
+        "bframes", 0, "threads", 2, "byte-stream", TRUE,
+        "aud", TRUE, "rc-lookahead", 0, nullptr);
+    g_object_set(tx_parser, "config-interval", -1, nullptr);
+    g_object_set(tx_payloader, "pt", 96, "mtu", 1400, "config-interval", -1, nullptr);
+    g_object_set(tx_sink, "host", cfg.host, "port", cfg.rtp_port, "sync", FALSE, "async", FALSE, nullptr);
+
+    gst_bin_add_many(GST_BIN(tx_pipeline_raw),
+        tx_src, tx_convert, tx_encoder, tx_parser, tx_payloader, tx_sink, nullptr);
+
+    // Link: src → convert → encoder
+    if (!gst_element_link_many(tx_src, tx_convert, tx_encoder, nullptr)) {
+        fprintf(stderr, "ERROR: Failed to link tx src → convert → encoder\n");
+        gst_object_unref(rx_pipeline);
+        gst_object_unref(tx_pipeline_raw);
+        return 1;
+    }
+
+    // Link encoder → parser with H.264 profile caps
+    GstCaps* h264_caps = gst_caps_new_simple("video/x-h264",
+        "profile", G_TYPE_STRING, "baseline", nullptr);
+    if (!gst_element_link_filtered(tx_encoder, tx_parser, h264_caps)) {
+        fprintf(stderr, "ERROR: Failed to link encoder → parser\n");
+        gst_caps_unref(h264_caps);
+        gst_object_unref(rx_pipeline);
+        gst_object_unref(tx_pipeline_raw);
+        return 1;
+    }
+    gst_caps_unref(h264_caps);
+
+    // Link: parser → payloader → sink
+    if (!gst_element_link_many(tx_parser, tx_payloader, tx_sink, nullptr)) {
+        fprintf(stderr, "ERROR: Failed to link tx parser → payloader → sink\n");
+        gst_object_unref(rx_pipeline);
+        gst_object_unref(tx_pipeline_raw);
+        return 1;
+    }
+
+    GstPipeline* tx_pipeline = GST_PIPELINE(tx_pipeline_raw);
+    GstElement* encoder = tx_encoder;
     GstElement* rx_sink = gst_bin_get_by_name(GST_BIN(rx_pipeline), "rx_sink");
 
     // ── Start Pipelines ──
@@ -186,12 +226,11 @@ int main(int argc, char* argv[]) {
         update_network(net, elapsed);
 
         // Create feedback report
-        // Gradient = delay change between consecutive steps (ms per step)
         double delay_gradient = net.delay_ms - prev_delay;
 
         gcc::FeedbackReport report;
         report.timestamp_us  = static_cast<uint64_t>(elapsed * 1e6);
-        report.delay_ms      = delay_gradient;  // Pass gradient directly
+        report.delay_ms      = delay_gradient;
         report.loss_fraction = net.loss_fraction;
 
         // Run GCC step
@@ -230,9 +269,8 @@ int main(int argc, char* argv[]) {
     gst_element_set_state(GST_ELEMENT(tx_pipeline), GST_STATE_NULL);
     gst_element_set_state(GST_ELEMENT(rx_pipeline), GST_STATE_NULL);
 
-    if (encoder) gst_object_unref(encoder);
     if (rx_sink) gst_object_unref(rx_sink);
-    gst_object_unref(tx_pipeline);
+    gst_object_unref(tx_pipeline_raw);
     gst_object_unref(rx_pipeline);
 
     // ── Final Stats ──
