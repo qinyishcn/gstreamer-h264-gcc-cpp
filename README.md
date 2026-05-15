@@ -1,6 +1,6 @@
 # H.264 + GCC Video Transmission System (C++ / GStreamer)
 
-基于 GStreamer C API 的 H.264 视频传输系统，集成 Google Congestion Control (GCC) 拥塞控制算法。适配 Ubuntu 20.04 LTS + GStreamer 1.16.x。
+基于 GStreamer C API 的 H.264 视频传输系统，集成 Google Congestion Control (GCC) 拥塞控制算法。适配 Ubuntu 20.04 LTS + GStreamer 1.16+（已做跨版本兼容处理）。
 
 ## 🎯 项目简介
 
@@ -42,6 +42,7 @@ gstreamer-h264-gcc-cpp/
 ### 环境要求
 
 - Ubuntu 20.04 LTS（推荐）/ 其他支持 GStreamer 1.16+ 的 Linux 发行版
+- GStreamer 1.18+ 可获得完整的接收帧统计（fakesink `stats` 属性）；1.16 下帧统计显示为 0 但不影响传输功能
 - CMake 3.10+
 - GCC/G++ 7+
 - GStreamer 1.16.x + 开发库

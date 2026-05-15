@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
     // Build pipeline using gst_parse_launch
     GError* error = nullptr;
     gchar* pipeline_str = g_strdup_printf(
-        "videotestsrc is-live=true pattern=ball ! video/x-raw,width=320,height=240,framerate=30/1 ! "
+        "videotestsrc is-live=true pattern=ball ! "
         "videoconvert ! "
         "x264enc tune=zerolatency speed-preset=%s bitrate=%d key-int-max=%d "
         "bframes=0 threads=%d byte-stream=true aud=true rc-lookahead=0 "

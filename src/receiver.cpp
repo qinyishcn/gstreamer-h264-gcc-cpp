@@ -118,8 +118,8 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Get stats from sink
-        if (sink) {
+        // Get stats from sink (requires GStreamer >= 1.18 for fakesink stats)
+        if (sink && gst_element_has_property(sink, "stats")) {
             GValue val = G_VALUE_INIT;
             g_object_get_property(G_OBJECT(sink), "stats", &val);
             if (G_VALUE_TYPE(&val) == GST_TYPE_STRUCTURE) {

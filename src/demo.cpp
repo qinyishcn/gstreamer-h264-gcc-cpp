@@ -202,9 +202,9 @@ int main(int argc, char* argv[]) {
             g_object_set(G_OBJECT(encoder), "bitrate", new_bitrate, nullptr);
         }
 
-        // Get RX stats
+        // Get RX stats (requires GStreamer >= 1.18 for fakesink stats)
         uint64_t rendered = 0;
-        if (rx_sink) {
+        if (rx_sink && gst_element_has_property(rx_sink, "stats")) {
             GValue val = G_VALUE_INIT;
             g_object_get_property(G_OBJECT(rx_sink), "stats", &val);
             if (G_VALUE_TYPE(&val) == GST_TYPE_STRUCTURE) {
