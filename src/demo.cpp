@@ -172,7 +172,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Link encoder → parser with H.264 profile caps
+    // Link encoder → parser with H.264 profile
+#if GST_CHECK_VERSION(1, 18, 0)
+    // GStreamer >= 1.18: set profile via caps filter
     GstCaps* h264_caps = gst_caps_new_simple("video/x-h264",
         "profile", G_TYPE_STRING, "baseline", nullptr);
     if (!gst_element_link_filtered(tx_encoder, tx_parser, h264_caps)) {
@@ -183,6 +185,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     gst_caps_unref(h264_caps);
+#else
+    // GStreamer < 1.18: set profile via option-string
+    g_object_set(tx_encoder, "option-string", "profile=baseline", nullptr);
+    if (!gst_element_link(tx_encoder, tx_parser)) {
+        fprintf(stderr, "ERROR: Failed to link encoder → parser\n");
+        gst_object_unref(rx_pipeline);
+        gst_object_unref(tx_pipeline_raw);
+        return 1;
+    }
+#endif
 
     // Link: parser → payloader → sink
     if (!gst_element_link_many(tx_parser, tx_payloader, tx_sink, nullptr)) {

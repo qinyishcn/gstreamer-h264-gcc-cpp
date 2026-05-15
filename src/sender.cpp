@@ -112,8 +112,8 @@ int main(int argc, char* argv[]) {
         "rc-lookahead", 0,
         nullptr);
 
-    // Set x264 profile via caps filter (option-string with profile= breaks on GStreamer 1.18+)
-    // Profile is negotiated through caps, not option-string
+    // Set x264 profile: caps filter on GStreamer >= 1.18, option-string on older versions
+    // On GStreamer 1.18+, option-string with profile= breaks caps negotiation
 
     // Configure h264parse
     g_object_set(parser, "config-interval", -1, nullptr);
@@ -144,7 +144,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Link encoder → parser with caps filter (sets H.264 profile)
+#if GST_CHECK_VERSION(1, 18, 0)
+    // GStreamer >= 1.18: set profile via caps filter
     GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
         "profile", G_TYPE_STRING, "baseline",
         nullptr);
@@ -155,6 +156,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     gst_caps_unref(h264_caps);
+#else
+    // GStreamer < 1.18: set profile via option-string
+    g_object_set(encoder, "option-string", "profile=baseline", nullptr);
+    if (!gst_element_link(encoder, parser)) {
+        fprintf(stderr, "ERROR: Failed to link encoder → parser\n");
+        gst_object_unref(pipeline);
+        return 1;
+    }
+#endif
 
     // Link: parser → payloader → sink
     if (!gst_element_link_many(parser, payloader, sink, nullptr)) {
