@@ -3,6 +3,8 @@
  *
  * Pipeline: videotestsrc → videoconvert → x264enc → h264parse → rtph264pay → udpsink
  *
+ * Builds pipeline element-by-element to avoid gst_parse_launch quoting issues.
+ *
  * Usage:
  *   ./sender [--host HOST] [--port PORT] [--bitrate KBPS] [--duration SEC]
  */
@@ -65,28 +67,79 @@ int main(int argc, char* argv[]) {
     printf("  Key int:   %d frames\n", cfg.key_int);
     printf("============================================================\n\n");
 
-    // Build pipeline using gst_parse_launch
-    GError* error = nullptr;
-    gchar* pipeline_str = g_strdup_printf(
-        "videotestsrc is-live=true pattern=ball ! "
-        "videoconvert ! "
-        "x264enc tune=zerolatency speed-preset=%s bitrate=%d key-int-max=%d "
-        "bframes=0 threads=%d byte-stream=true aud=true rc-lookahead=0 "
-        "option-string=\"profile=baseline\" ! "
-        "h264parse config-interval=-1 ! "
-        "rtph264pay pt=96 mtu=1400 config-interval=-1 ! "
-        "udpsink host=%s port=%d sync=false async=false",
-        cfg.preset, cfg.bitrate, cfg.key_int, cfg.threads,
-        cfg.host, cfg.rtp_port
-    );
+    // ── Build pipeline element-by-element (avoids gst_parse_launch quoting issues) ──
 
-    GstPipeline* pipeline = GST_PIPELINE(gst_parse_launch(pipeline_str, &error));
-    g_free(pipeline_str);
+    GstElement *pipeline, *src, *convert, *encoder, *parser, *payloader, *sink;
+    pipeline  = gst_pipeline_new("sender-pipeline");
+    src       = gst_element_factory_make("videotestsrc",  "video-src");
+    convert   = gst_element_factory_make("videoconvert",  "video-convert");
+    encoder   = gst_element_factory_make("x264enc",       "encoder");
+    parser    = gst_element_factory_make("h264parse",     "h264-parser");
+    payloader = gst_element_factory_make("rtph264pay",    "rtp-payloader");
+    sink      = gst_element_factory_make("udpsink",       "udp-sink");
 
-    if (!pipeline || error) {
-        fprintf(stderr, "ERROR: Failed to create pipeline: %s\n",
-                error ? error->message : "unknown");
-        if (error) g_error_free(error);
+    // Verify all elements were created
+    if (!pipeline || !src || !convert || !encoder || !parser || !payloader || !sink) {
+        fprintf(stderr, "ERROR: Failed to create elements:\n");
+        if (!src)       fprintf(stderr, "  ✗ videotestsrc  (check: gstreamer1.0-plugins-base)\n");
+        if (!convert)   fprintf(stderr, "  ✗ videoconvert  (check: gstreamer1.0-plugins-base)\n");
+        if (!encoder)   fprintf(stderr, "  ✗ x264enc       (check: gstreamer1.0-plugins-ugly)\n");
+        if (!parser)    fprintf(stderr, "  ✗ h264parse     (check: gstreamer1.0-plugins-bad)\n");
+        if (!payloader) fprintf(stderr, "  ✗ rtph264pay    (check: gstreamer1.0-plugins-good)\n");
+        if (!sink)      fprintf(stderr, "  ✗ udpsink       (check: gstreamer1.0-plugins-good)\n");
+        gst_object_unref(pipeline);
+        return 1;
+    }
+
+    // Configure videotestsrc
+    g_object_set(src,
+        "is-live", TRUE,
+        "pattern", 1,  // ball pattern
+        nullptr);
+
+    // Configure x264enc
+    // Use string enum values for cross-version compatibility
+    g_object_set(encoder,
+        "tune",         "zerolatency",
+        "speed-preset", "ultrafast",
+        "bitrate",      cfg.bitrate,
+        "key-int-max",  cfg.key_int,
+        "bframes",      0,
+        "threads",      cfg.threads,
+        "byte-stream",  TRUE,
+        "aud",          TRUE,
+        "rc-lookahead", 0,
+        nullptr);
+
+    // Set x264 profile via option-string
+    g_object_set(encoder, "option-string", "profile=baseline", nullptr);
+
+    // Configure h264parse
+    g_object_set(parser, "config-interval", -1, nullptr);
+
+    // Configure rtph264pay
+    g_object_set(payloader,
+        "pt",              96,
+        "mtu",             1400,
+        "config-interval", -1,
+        nullptr);
+
+    // Configure udpsink
+    g_object_set(sink,
+        "host", cfg.host,
+        "port", cfg.rtp_port,
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr);
+
+    // Add all elements to pipeline and link
+    gst_bin_add_many(GST_BIN(pipeline),
+        src, convert, encoder, parser, payloader, sink, nullptr);
+
+    // Link: src → convert → encoder → parser → payloader → sink
+    if (!gst_element_link_many(src, convert, encoder, parser, payloader, sink, nullptr)) {
+        fprintf(stderr, "ERROR: Failed to link pipeline elements\n");
+        gst_object_unref(pipeline);
         return 1;
     }
 
@@ -95,9 +148,19 @@ int main(int argc, char* argv[]) {
     gst_bus_add_signal_watch(bus);
 
     // Start pipeline
-    GstStateChangeReturn ret = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PLAYING);
-    if (ret == GST_STATE_CHANGE_FAILURE) {
+    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (state_ret == GST_STATE_CHANGE_FAILURE) {
         fprintf(stderr, "ERROR: Failed to set pipeline to PLAYING\n");
+        gst_object_unref(bus);
+        gst_object_unref(pipeline);
+        return 1;
+    }
+
+    // Wait for state change to complete (important for live sources)
+    GstState state;
+    GstStateChangeReturn pending_ret = gst_element_get_state(pipeline, &state, nullptr, 2 * GST_SECOND);
+    if (pending_ret == GST_STATE_CHANGE_FAILURE) {
+        fprintf(stderr, "ERROR: Pipeline failed to reach PLAYING state\n");
         gst_object_unref(bus);
         gst_object_unref(pipeline);
         return 1;
@@ -146,7 +209,7 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     printf("\n🛑 Stopping sender...\n");
-    gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_NULL);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
 
     gst_object_unref(bus);
     gst_object_unref(pipeline);
