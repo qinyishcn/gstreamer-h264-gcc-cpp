@@ -27,9 +27,17 @@
 #include "gcc_controller.h"
 
 static std::atomic<bool> running{true};
+static std::atomic<uint64_t> demo_frame_count{0};
 
 static void signal_handler(int /*sig*/) {
     running.store(false);
+}
+
+/** Pad probe: count decoded frames at receiver sink */
+static GstPadProbeReturn
+demo_count_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer /*user_data*/) {
+    demo_frame_count.fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_OK;
 }
 
 // ── Simulated Network ──────────────────────────────────────────────
@@ -198,6 +206,15 @@ int main(int argc, char* argv[]) {
     GstElement* encoder = tx_encoder;
     GstElement* rx_sink = gst_bin_get_by_name(GST_BIN(rx_pipeline), "rx_sink");
 
+    // Add pad probe on receiver sink for frame counting (works on all GStreamer versions)
+    if (rx_sink) {
+        GstPad* sink_pad = gst_element_get_static_pad(rx_sink, "sink");
+        if (sink_pad) {
+            gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER, demo_count_probe, nullptr, nullptr);
+            gst_object_unref(sink_pad);
+        }
+    }
+
     // ── Start Pipelines ──
     printf("🚀 Starting receiver...\n");
     gst_element_set_state(GST_ELEMENT(rx_pipeline), GST_STATE_PLAYING);
@@ -243,17 +260,8 @@ int main(int argc, char* argv[]) {
             g_object_set(G_OBJECT(encoder), "bitrate", new_bitrate, nullptr);
         }
 
-        // Get RX stats (requires GStreamer >= 1.18 for fakesink stats)
-        uint64_t rendered = 0;
-        if (rx_sink && gst_element_has_property(rx_sink, "stats")) {
-            GValue val = G_VALUE_INIT;
-            g_object_get_property(G_OBJECT(rx_sink), "stats", &val);
-            if (G_VALUE_TYPE(&val) == GST_TYPE_STRUCTURE) {
-                const GstStructure* stats = (const GstStructure*)g_value_get_boxed(&val);
-                gst_structure_get_uint64(stats, "rendered", &rendered);
-                g_value_unset(&val);
-            }
-        }
+        // Get RX frame count from pad probe
+        uint64_t rendered = demo_frame_count.load(std::memory_order_relaxed);
 
         auto st = gcc.get_stats();
         printf("  [%5.1f] %-8s  %6d kbps  %-10s  Loss:%4.1f%%  Delay:%5.1fms  RX:%lu\n",

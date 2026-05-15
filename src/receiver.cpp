@@ -3,6 +3,8 @@
  *
  * Pipeline: udpsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → fakesink
  *
+ * Uses pad probe for frame counting (works on all GStreamer versions).
+ *
  * Usage:
  *   ./receiver [--port PORT] [--output fakesink|display]
  */
@@ -19,9 +21,20 @@
 #include "gst_compat.h"
 
 static std::atomic<bool> running{true};
+static std::atomic<uint64_t> frame_count{0};
 
 static void signal_handler(int /*sig*/) {
     running.store(false);
+}
+
+/**
+ * Pad probe callback: counts each buffer that arrives at the sink pad.
+ * Works on ALL GStreamer versions (no fakesink stats property needed).
+ */
+static GstPadProbeReturn
+count_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer /*user_data*/) {
+    frame_count.fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_OK;
 }
 
 struct ReceiverConfig {
@@ -52,7 +65,7 @@ int main(int argc, char* argv[]) {
     printf("  Output:  %s\n", cfg.output);
     printf("============================================================\n\n");
 
-    // Build pipeline
+    // Build pipeline using gst_parse_launch
     GError* error = nullptr;
     gchar* pipeline_str = g_strdup_printf(
         "udpsrc port=%d caps=application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 ! "
@@ -74,8 +87,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Get sink for stats
+    // Get sink and add pad probe for frame counting
     GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "video_sink");
+    if (sink) {
+        GstPad* sink_pad = gst_element_get_static_pad(sink, "sink");
+        if (sink_pad) {
+            gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER, count_probe, nullptr, nullptr);
+            gst_object_unref(sink_pad);
+        }
+    }
 
     GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
     gst_bus_add_signal_watch(bus);
@@ -84,7 +104,7 @@ int main(int argc, char* argv[]) {
     GstStateChangeReturn ret = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         fprintf(stderr, "ERROR: Failed to set pipeline to PLAYING\n");
-        gst_object_unref(sink);
+        if (sink) gst_object_unref(sink);
         gst_object_unref(bus);
         gst_object_unref(pipeline);
         return 1;
@@ -93,7 +113,6 @@ int main(int argc, char* argv[]) {
     printf("✅ Receiver listening on port %d\n\n", cfg.rtp_port);
 
     auto start = std::chrono::steady_clock::now();
-    uint64_t total_rendered = 0;
     int last_sec = -1;
 
     while (running.load()) {
@@ -118,24 +137,12 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Get stats from sink (requires GStreamer >= 1.18 for fakesink stats)
-        if (sink && gst_element_has_property(sink, "stats")) {
-            GValue val = G_VALUE_INIT;
-            g_object_get_property(G_OBJECT(sink), "stats", &val);
-            if (G_VALUE_TYPE(&val) == GST_TYPE_STRUCTURE) {
-                const GstStructure* stats = (const GstStructure*)g_value_get_boxed(&val);
-                guint64 rendered = 0;
-                gst_structure_get_uint64(stats, "rendered", &rendered);
-                total_rendered = rendered;
-                g_value_unset(&val);
-            }
-        }
-
         // Print stats every second
         int sec = static_cast<int>(elapsed);
         if (sec != last_sec && sec > 0) {
             last_sec = sec;
-            printf("  [%3ds] Received: %lu frames\n", sec, (unsigned long)total_rendered);
+            printf("  [%3ds] Received: %lu frames\n", sec,
+                   (unsigned long)frame_count.load(std::memory_order_relaxed));
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -149,7 +156,7 @@ int main(int argc, char* argv[]) {
     gst_object_unref(bus);
     gst_object_unref(pipeline);
 
-    printf("✅ Receiver stopped — %lu total frames rendered\n",
-           (unsigned long)total_rendered);
+    printf("✅ Receiver stopped — %lu total frames received\n",
+           (unsigned long)frame_count.load(std::memory_order_relaxed));
     return 0;
 }
