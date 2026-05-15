@@ -43,6 +43,7 @@ gstreamer-h264-gcc-cpp/
 
 - Ubuntu 20.04 LTS（推荐）/ 其他支持 GStreamer 1.16+ 的 Linux 发行版
 - GStreamer 1.18+ 可获得完整的接收帧统计（fakesink `stats` 属性）；1.16 下帧统计显示为 0 但不影响传输功能
+- H.264 profile 设置方式：1.18+ 通过 caps 协商，1.16 通过 `option-string`（编译期自动选择）
 - CMake 3.10+
 - GCC/G++ 7+
 - GStreamer 1.16.x + 开发库
