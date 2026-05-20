@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(gstreamer-h264-gcc VERSION 1.0.0 LANGUAGES C CXX)
+project(gstreamer-h264-gcc VERSION 2.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,7 @@ set(CMAKE_C_STANDARD 11)
 
 # Find GStreamer
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(GST REQUIRED
     gstreamer-1.0
     gstreamer-app-1.0
@@ -29,15 +30,15 @@ target_link_libraries(gcc_controller ${GST_LIBRARIES})
 
 # ── Sender ──
 add_executable(sender src/sender.cpp)
-target_link_libraries(sender ${GST_LIBRARIES} gcc_controller)
+target_link_libraries(sender ${GST_LIBRARIES} gcc_controller Threads::Threads)
 
 # ── Receiver ──
 add_executable(receiver src/receiver.cpp)
-target_link_libraries(receiver ${GST_LIBRARIES} gcc_controller)
+target_link_libraries(receiver ${GST_LIBRARIES} gcc_controller Threads::Threads)
 
 # ── Demo ──
 add_executable(demo src/demo.cpp)
-target_link_libraries(demo ${GST_LIBRARIES} gcc_controller)
+target_link_libraries(demo ${GST_LIBRARIES} gcc_controller Threads::Threads)
 
 # ── Install ──
 install(TARGETS sender receiver demo
@@ -50,6 +51,7 @@ message(STATUS "")
 message(STATUS "=== Build Configuration ===")
 message(STATUS "  C++ standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "  GStreamer:     ${GST_VERSION}")
+message(STATUS "  Version:       2.0.0 (with feedback channel)")
 message(STATUS "  Install to:    ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "===========================")
 message(STATUS "")

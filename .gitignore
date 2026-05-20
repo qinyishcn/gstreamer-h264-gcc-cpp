@@ -10,3 +10,5 @@ Makefile
 cmake_install.cmake
 .DS_Store
 *.log
+test_build.sh
+test_docker.sh
