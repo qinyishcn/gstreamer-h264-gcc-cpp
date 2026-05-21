@@ -234,16 +234,14 @@ int main(int argc, char* argv[]) {
 
             auto st = gcc_ctrl.get_stats();
             int sec = static_cast<int>(elapsed);
-            if (sec != last_printed) {
-                last_printed = sec;
-                printf("  [%3ds] %6d kbps  %-10s  Loss:%4.1f%%  Delay:%7.2fms  FB:%d\n",
-                       sec, new_bitrate,
-                       st.current_state == gcc::State::DECREASE ? "decrease" :
-                       st.current_state == gcc::State::INCREASE ? "increase" : "hold",
-                       st.loss_fraction * 100.0,
-                       report.delay_ms,
-                       feedback_count);
-            }
+            printf("  [%3ds] %6d kbps  %-10s  Loss:%4.1f%%  Delay:%7.2fms  FB:%d\n",
+                   sec, new_bitrate,
+                   st.current_state == gcc::State::DECREASE ? "decrease" :
+                   st.current_state == gcc::State::INCREASE ? "increase" : "hold",
+                   st.loss_fraction * 100.0,
+                   report.delay_ms,
+                   feedback_count);
+            last_printed = sec;
         } else {
             int sec = static_cast<int>(elapsed);
             if (sec != last_printed) {
