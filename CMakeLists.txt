@@ -1,57 +1,66 @@
 cmake_minimum_required(VERSION 3.10)
-project(gstreamer-h264-gcc VERSION 2.0.1 LANGUAGES C CXX)
+project(gstreamer-h264-gcc VERSION 4.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 14)
+# v4.0.0: Loss-based bitrate adaptation via razor feedback
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
-# Find GStreamer
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
-pkg_check_modules(GST REQUIRED
-    gstreamer-1.0
-    gstreamer-app-1.0
-    gstreamer-video-1.0
-)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
 
-include_directories(
-    ${CMAKE_SOURCE_DIR}/include
-    ${GST_INCLUDE_DIRS}
-)
+# ── Razor GCC Library (vendored) ──
+file(GLOB RAZOR_CC     vendor/razor/cc/*.c)
+file(GLOB RAZOR_EST    vendor/razor/estimator/*.c)
+file(GLOB RAZOR_PACE   vendor/razor/pacing/*.c)
+file(GLOB RAZOR_COMMON vendor/razor/common/*.c)
+file(GLOB RAZOR_POSIX  vendor/razor/common/platform/posix/*.c)
+file(GLOB RAZOR_BBR    vendor/razor/bbr/*.c)
+file(GLOB RAZOR_REMB   vendor/razor/remb/*.c)
 
+add_library(razor STATIC
+    ${RAZOR_CC} ${RAZOR_EST} ${RAZOR_PACE}
+    ${RAZOR_COMMON} ${RAZOR_POSIX}
+    ${RAZOR_BBR} ${RAZOR_REMB}
+)
+target_include_directories(razor PUBLIC
+    vendor/razor/cc vendor/razor/estimator vendor/razor/pacing
+    vendor/razor/common vendor/razor/common/platform/posix
+    vendor/razor/bbr vendor/razor/remb
+)
+target_compile_options(razor PRIVATE -Wno-unused-variable -Wno-unused-function -Wno-missing-braces -Wno-unused-but-set-variable)
+target_link_libraries(razor Threads::Threads)
+
+# ── Main project ──
+include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(vendor/razor/cc)
 link_directories(${GST_LIBRARY_DIRS})
 add_compile_options(${GST_CFLAGS_OTHER})
 
-# ── GCC Controller Library ──
-add_library(gcc_controller STATIC
-    src/gcc_controller.cpp
-)
+add_library(gcc_controller STATIC src/gcc_controller.cpp)
+target_include_directories(gcc_controller PUBLIC ${GST_INCLUDE_DIRS})
 target_link_libraries(gcc_controller ${GST_LIBRARIES})
 
-# ── Sender ──
 add_executable(sender src/sender.cpp)
-target_link_libraries(sender ${GST_LIBRARIES} gcc_controller Threads::Threads)
+target_include_directories(sender PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(sender ${GST_LIBRARIES} razor Threads::Threads)
 
-# ── Receiver ──
 add_executable(receiver src/receiver.cpp)
-target_link_libraries(receiver ${GST_LIBRARIES} gcc_controller Threads::Threads)
+target_include_directories(receiver PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(receiver ${GST_LIBRARIES} razor Threads::Threads)
 
-# ── Demo ──
 add_executable(demo src/demo.cpp)
-target_link_libraries(demo ${GST_LIBRARIES} gcc_controller Threads::Threads)
+target_include_directories(demo PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(demo ${GST_LIBRARIES} razor Threads::Threads)
 
-# ── Install ──
-install(TARGETS sender receiver demo
-    RUNTIME DESTINATION bin
-)
+install(TARGETS sender receiver demo RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
 
-# ── Summary ──
 message(STATUS "")
 message(STATUS "=== Build Configuration ===")
 message(STATUS "  C++ standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "  GStreamer:     ${GST_VERSION}")
-message(STATUS "  Version:       2.0.1 (with feedback channel)")
-message(STATUS "  Install to:    ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "  Version:       3.0.0 (razor GCC integration)")
 message(STATUS "===========================")
 message(STATUS "")

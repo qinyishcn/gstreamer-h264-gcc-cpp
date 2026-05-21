@@ -74,6 +74,16 @@ int Controller::step(const FeedbackReport& report) {
             break;
     }
 
+    // ── Loss-based rate reduction (RFC 8298 §5) ──
+    // High loss means the channel is congested; reduce regardless of delay state.
+    if (loss_fraction_ > 0.10) {
+        // Loss > 10%: multiply decrease
+        double loss_factor = 1.0 - loss_fraction_;  // e.g., 0.2 loss → factor 0.8
+        if (loss_factor < md_factor_) loss_factor = md_factor_;  // don't decrease more than md_factor
+        current_bitrate_kbps_ = static_cast<int>(
+            current_bitrate_kbps_ * loss_factor);
+    }
+
     // Clamp bitrate
     current_bitrate_kbps_ = std::max(min_bitrate_kbps_,
                                       std::min(max_bitrate_kbps_, current_bitrate_kbps_));
