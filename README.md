@@ -1,16 +1,17 @@
 # H.264 + GCC Video Transmission System (C++ / GStreamer)
 
-基于 GStreamer C API 的 H.264 视频传输系统，集成 Google Congestion Control (GCC) 拥塞控制算法。已在 GStreamer 1.16.3（Ubuntu 20.04）和 1.28.2（Ubuntu 24.04）上验证通过。
+基于 GStreamer C API 的 H.264 视频传输系统，集成 [razor](https://github.com/yuanrongxi/razor) GCC 拥塞控制算法。已在 GStreamer 1.16.3（Ubuntu 20.04）和 1.28.2（Ubuntu 24.04）上验证通过。
 
 ## 🎯 项目简介
 
-本项目使用纯 C/C++ 实现，基于 GStreamer 1.16 C API 构建视频传输管线：
+本项目使用纯 C/C++ 实现，基于 GStreamer C API 构建视频传输管线：
 
 - **H.264 编解码**：x264enc 编码 → avdec_h264 解码
 - **RTP 传输**：UDP 承载 RTP 视频流
-- **GCC 拥塞控制**：延迟梯度检测 + Kalman 滤波 + AIMD 速率控制
+- **razor GCC 拥塞控制**：延迟梯度检测 + Kalman 滤波 + AIMD 速率控制（via razor library）
+- **Loss-based 自适应**：丢包率平滑 + 20% max step 限幅
+- **RTT 估算**：反馈通道携带接收/发送时间戳，sender 端计算真实 RTT
 - **动态码率调整**：运行时通过 `g_object_set()` 调整 x264enc 码率
-- **反馈通道**：Receiver 通过 UDP 反馈通道向 Sender 发送丢包率和延迟梯度
 
 ### 架构
 
@@ -25,21 +26,13 @@ Sender                                    Receiver
        │                                │
        │    Feedback/UDP (port+1)       │
        │←───────────────────────────────│
-       │  {seq, rtp_ts, rx_ts, loss%}  │
-       │                                │
+       │  {seq, loss%, rx_ts, fb_ts,    │
+       │   razor_payload}               │
        ▼                                │
-  GCC Controller ◄─────────────────────┘
-  (adjust bitrate)
-```
-
-### 核心算法
-
-```
-Network Condition → Delay Gradient → Overuse Detector → Rate Control
-                                                    ↓
-                                         DECREASE (×0.85)
-                                         INCREASE (+step)
-                                         HOLD
+  razor::Sender ◄──────────────────────┘
+  (GCC bandwidth estimation)
+  + loss-based adaptation
+  (adjust x264enc bitrate)
 ```
 
 ## 📁 项目结构
@@ -47,15 +40,19 @@ Network Condition → Delay Gradient → Overuse Detector → Rate Control
 ```
 gstreamer-h264-gcc-cpp/
 ├── include/
-│   ├── gcc_controller.h       # GCC 控制器头文件
-│   ├── feedback_channel.h     # UDP 反馈通道
+│   ├── gcc_controller.h       # 自研 GCC 控制器（备用）
+│   ├── feedback_channel.h     # UDP 反馈通道 + LossTracker
+│   ├── razor_wrapper.h        # razor C++ 封装（kbps↔bps 转换）
 │   └── gst_compat.h           # GStreamer 跨版本兼容宏
 ├── src/
-│   ├── gcc_controller.cpp     # GCC 算法实现
-│   ├── sender.cpp             # 发送端（含反馈接收）
-│   ├── receiver.cpp           # 接收端（含反馈发送）
-│   └── demo.cpp               # 完整演示
+│   ├── gcc_controller.cpp     # 自研 GCC 算法实现
+│   ├── sender.cpp             # 发送端（razor + loss-based 适配）
+│   ├── receiver.cpp           # 接收端（razor 反馈 + LossTracker）
+│   └── demo.cpp               # 完整演示（同进程 sender+receiver）
+├── vendor/razor/              # razor 库源码（vendored）
 ├── CMakeLists.txt
+├── Dockerfile.test            # GStreamer 1.16 Docker 测试环境
+├── docker-test.sh             # 自动化测试脚本
 ├── install.sh
 └── README.md
 ```
@@ -65,10 +62,10 @@ gstreamer-h264-gcc-cpp/
 ### 环境要求
 
 - Ubuntu 20.04 LTS（推荐）/ 其他支持 GStreamer 1.16+ 的 Linux 发行版
-- GStreamer 1.18+ 可获得完整的接收帧统计；1.16 下帧统计显示为 0 但不影响传输功能
 - CMake 3.10+
-- GCC/G++ 7+
+- GCC/G++ 7+（支持 C++14）
 - GStreamer 1.16.x + 开发库
+- pthread
 
 ### 安装依赖
 
@@ -93,148 +90,98 @@ sudo apt-get install -y \
 
 ```bash
 mkdir build && cd build
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-### 运行 Demo（真实反馈闭环）
+### 运行 Demo
 
 ```bash
-# 完整演示（GCC 拥塞控制 + 真实反馈通道）
+# 完整演示（razor GCC + loss-based 自适应 + 真实反馈通道）
 ./build/demo --duration 20
 
 # 自定义参数
-./build/demo --duration 30 --bitrate 3000 --gradient-threshold 0.4
+./build/demo --duration 30 --bitrate 3000
 ```
 
 ### 分别运行 Sender / Receiver
 
 ```bash
-# 终端 1：启动接收端（自动向 sender:port+1 发送反馈）
+# 终端 1：启动接收端
 ./build/receiver --port 5004 --sender-host 127.0.0.1
 
-# 终端 2：启动发送端（监听 port+1 接收反馈，动态调整码率）
+# 终端 2：启动发送端
 ./build/sender --host 127.0.0.1 --port 5004 --bitrate 2000
 ```
 
-### 关于测试视频
+### Docker 测试（GStreamer 1.16）
 
-本项目使用 GStreamer 内置的 `videotestsrc` 元素作为视频源，**无需外部视频文件**。
+```bash
+# 构建测试镜像（Ubuntu 20.04 = GStreamer 1.16.3）
+docker build -f Dockerfile.test -t h264-gcc-test .
+
+# 运行基础测试
+docker run --rm h264-gcc-test
+
+# 运行带 tc/netem 的网络条件测试
+docker run --rm --cap-add NET_ADMIN h264-gcc-test bash -c \
+    "apt-get update -qq && apt-get install -qq -y iproute2 && bash /app/docker-test.sh"
+```
 
 ## 📖 反馈通道设计
 
-### 协议格式
+### 协议格式（v3）
 
-反馈通道使用轻量级二进制 UDP 包（24 字节），通过 RTP 端口 +1 传输：
+反馈通道使用轻量级二进制 UDP 包（18 字节头 + 变长 payload），通过 RTP 端口 +1 传输：
 
 | 字段 | 大小 | 说明 |
 |------|------|------|
 | magic | 1B | 固定值 0xCC |
-| version | 1B | 协议版本（当前为 1） |
-| seq | 2B | RTP 序列号 |
-| sender_timestamp_us | 8B | Sender 发送时间（本地 wall clock，微秒） |
-| receiver_timestamp_us | 8B | Receiver 到达时间（本地 wall clock，微秒） |
-| loss_pct_x100 | 1B | 丢包率 × 100（如 35 = 0.35%） |
-| padding | 3B | 保留字段 |
+| version | 1B | 协议版本（3 = razor + RTT） |
+| seq | 2B | 最新 RTP 序列号 |
+| loss_pct_x100 | 1B | 丢包率 × 100（如 5 = 0.05%） |
+| fb_size | 2B | razor 反馈数据大小 |
+| rx_ts_ms | 4B | Receiver 收到包的时间（ms） |
+| fb_ts_ms | 4B | Receiver 发送反馈的时间（ms） |
+| padding | 2B | 保留字段 |
+| fb_data | 0-256B | razor 反馈 payload |
 
-总大小：24 字节（`#pragma pack(1)`）
+### RTT 估算
 
-### 延迟梯度计算
-
-1. Sender 在 RTP payload 中嵌入时间戳（90kHz 时钟）
-2. Receiver 通过 pad probe 捕获每个 RTP 包：
-   - 提取 RTP 序列号和时间戳
-   - 记录本地到达时间（微秒精度）
-3. Receiver 每 500ms 发送一个 FeedbackReport：
-   - `sender_timestamp_us`：最新包的 RTP 时间戳
-   - `receiver_timestamp_us`：最新包的到达时间
-   - `loss_fraction`：当前丢包率
-4. Sender 收到报告后：
-   - `delay_ms = receiver_timestamp_us - sender_timestamp_us`（单向延迟估计）
-   - GCC Controller 计算延迟梯度变化 → 状态机决策 → 调整码率
+Sender 收到反馈后计算：
+```
+RTT = now_ms - fb.rx_ts_ms
+```
+其中 `now_ms` 是 sender 收到反馈的本地时间，`rx_ts_ms` 是 receiver 收到 RTP 包的时间。这个值包含了 receiver 处理延迟 + 网络传输延迟，乘以约 2 倍即为近似 RTT。
 
 ### 丢包率计算
 
-Receiver 通过 RTP 序列号跟踪丢包：
+Receiver 通过 RTP 序列号跟踪丢包（`LossTracker` 类）：
 - 维护 `received` 和 `expected` 计数器
-- 序列号递增时：`expected += diff`，`received += 1`
+- 处理 16-bit 序列号环绕
 - 丢包率 = `1 - received / expected`
-- 每秒重置统计，计算瞬时丢包率
 
 ### 关键代码路径
 
 ```
 Sender:
-  sender.cpp → rtp_out_probe()       — 记录发出的 RTP 时间戳
-             → main loop poll()       — 接收反馈，调整码率
+  sender.cpp → rtp_out_probe()          — 记录发出的 RTP seq
+             → main loop poll()          — 接收反馈
+             → update_rtt()              — 更新 razor RTT
+             → on_feedback()             — 喂给 razor 做带宽估计
+             → loss-based callback       — 丢包率平滑 + 码率调整
 
 Receiver:
-  receiver.cpp → rtp_in_probe()      — 提取 RTP seq/ts，记录到达时间
-               → send_report()        — 每 500ms 发送反馈
+  receiver.cpp → rtp_in_probe()         — 提取 RTP seq，记录到达时间
+               → razor_rx.on_received()  — 通知 razor 收到包
+               → razor_rx.heartbeat()    — razor 生成反馈
+               → send_feedback()         — 发送反馈（含时间戳）
 
 Demo:
-  demo.cpp → rtp_in_probe()          — Receiver 侧 RTP 采集
-           → sender_fb.poll()         — Sender 侧反馈接收
-           → gcc_ctrl.step(report)    — GCC 码率调整
+  demo.cpp → 同进程 sender + receiver
+           → 通过 FeedbackChannel 连接
+           → razor_tx + razor_rx 双向拥塞控制
 ```
-
-## 📖 代码说明
-
-### gcc_controller.h / .cpp — GCC 拥塞控制
-
-```cpp
-#include "gcc_controller.h"
-
-// 初始化控制器
-gcc::Controller gcc(
-    2000,    // 初始码率 kbps
-    200,     // 最低码率
-    8000,    // 最高码率
-    0.4,     // 过载检测阈值
-    0.15     // 保持阈值
-);
-
-// 处理反馈
-gcc::FeedbackReport report;
-report.timestamp_us = get_timestamp_us();
-report.delay_ms     = measured_delay;
-report.loss_fraction = loss_rate;
-
-int new_bitrate = gcc.step(report);
-
-// 动态调整编码器
-g_object_set(G_OBJECT(encoder), "bitrate", new_bitrate, nullptr);
-```
-
-### feedback_channel.h — UDP 反馈通道
-
-```cpp
-#include "feedback_channel.h"
-
-// Receiver 侧：发送反馈
-gcc::FeedbackChannel fb("127.0.0.1", 5005, false);  // 目标 sender
-fb.start();
-fb.on_rtp_packet(rtp_ts_us, arrival_us, seq);  // pad probe 中调用
-fb.send_report(loss_fraction);                   // 定期调用
-
-// Sender 侧：接收反馈
-gcc::FeedbackChannel fb("0.0.0.0", 5005, true);    // 监听
-fb.start();
-gcc::FeedbackReport report;
-if (fb.poll(report)) {
-    gcc.step(report);  // 喂给 GCC controller
-}
-```
-
-### demo.cpp — 完整演示
-
-Demo 在同一进程中运行 sender + receiver，通过反馈通道连接：
-
-| 阶段 | 行为 |
-|------|------|
-| 启动 | Receiver 先启动，Sender 随后启动 |
-| 运行 | Receiver 每 500ms 发送反馈；Sender 实时调整码率 |
-| 反馈内容 | 延迟梯度 + 丢包率 → GCC Controller 决策 |
 
 ## 🔧 参数说明
 
@@ -244,11 +191,6 @@ Demo 在同一进程中运行 sender + receiver，通过反馈通道连接：
 |------|--------|------|
 | `--duration` | 20 | 演示时长 (秒) |
 | `--bitrate` | 2000 | 初始码率 (kbps) |
-| `--min-bitrate` | 200 | 最低码率 |
-| `--max-bitrate` | 8000 | 最高码率 |
-| `--gradient-threshold` | 0.4 | 过载检测阈值 |
-| `--hold-threshold` | 0.15 | 保持状态阈值 |
-| `--host` | 127.0.0.1 | 目标主机 |
 | `--port` | 5004 | RTP 端口（反馈端口 = port+1） |
 
 ### Sender 参数
@@ -260,6 +202,7 @@ Demo 在同一进程中运行 sender + receiver，通过反馈通道连接：
 | `--bitrate` | 2000 | 初始编码码率 (kbps) |
 | `--preset` | ultrafast | x264 编码预设 |
 | `--duration` | 20 | 发送时长 (秒) |
+| `--threads` | 2 | x264 编码线程数 |
 
 ### Receiver 参数
 
@@ -267,22 +210,28 @@ Demo 在同一进程中运行 sender + receiver，通过反馈通道连接：
 |------|--------|------|
 | `--port` | 5004 | RTP 端口 |
 | `--sender-host` | 127.0.0.1 | Sender IP（反馈发往此地址） |
-| `--output` | fakesink | 输出方式 |
 
-## 🧪 测试验证
+## 🧪 测试验证（GStreamer 1.16.3 Docker）
 
-- ✅ GCC 控制器：延迟梯度检测 + Kalman 滤波 + AIMD
-- ✅ 反馈通道：UDP 二进制协议，24 字节轻量包
-- ✅ RTP 采集：Pad probe 提取 seq + timestamp，兼容所有 GStreamer 版本
-- ✅ 丢包率计算：基于 RTP 序列号间隙
-- ✅ 跨版本验证：GStreamer 1.16.3（Docker/Ubuntu 20.04）+ 1.28.2（Ubuntu 24.04）
+| 场景 | RTT | 码率行为 | 反馈数 |
+|------|-----|---------|--------|
+| Baseline (no tc) | 20-40ms | 2000→2080 kbps ↑ | ~480 |
+| 50ms delay + 5% loss | 50-70ms | 2000→1850-2000 kbps | ~350 |
+| 100ms delay + 10% loss | 85-140ms | 2000→1600-1800 kbps | ~490 |
+| 200ms delay + 15% loss | 100-150ms | 2000→1300-1500 kbps | ~430 |
+
+### 已知限制
+
+- GStreamer 1.16 下 receiver 的解码帧统计显示为 0（不影响传输功能）
+- 高丢包+高延迟下解码器可能暂时卡住（pipeline 本身正常）
+- RTT 估算为近似值（包含 receiver 处理延迟）
 
 ## 📚 参考文献
 
+- [razor](https://github.com/yuanrongxi/razor) - GCC/BBR/REMB 拥塞控制库
 - [RFC 8298] - Google Congestion Control for Real-time Web Communication
 - [RFC 3550] - RTP: A Transport Protocol for Real-Time Applications
 - [GStreamer 1.16 Documentation](https://gstreamer.freedesktop.org/documentation/)
-- [x264enc API](https://gstreamer.freedesktop.org/documentation/x264enc.html)
 
 ## 📄 License
 
