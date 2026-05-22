@@ -40,7 +40,7 @@ static GstPadProbeReturn rtp_out_probe(GstPad*, GstPadProbeInfo* info, gpointer 
 }
 
 // Receiver probe
-struct RxProbeData { razor::Receiver* rx; uint16_t* last_seq; uint64_t* pkt_count; };
+struct RxProbeData { razor::Receiver* rx; uint16_t* last_seq; uint64_t* pkt_count; std::atomic<uint32_t>* last_rx_ts_ms; };
 static GstPadProbeReturn rtp_in_probe(GstPad*, GstPadProbeInfo* info, gpointer ud) {
     auto* d = static_cast<RxProbeData*>(ud);
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
@@ -51,10 +51,11 @@ static GstPadProbeReturn rtp_in_probe(GstPad*, GstPadProbeInfo* info, gpointer u
     if (parse_rtp_seq(map.data, map.size, seq)) {
         *d->last_seq = seq;
         (*d->pkt_count)++;
-        uint32_t ts = static_cast<uint32_t>(
+        uint32_t now_ms = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
-        d->rx->on_received(seq, ts, map.size);
+        d->last_rx_ts_ms->store(now_ms);
+        d->rx->on_received(seq, now_ms, map.size);
     }
     gst_buffer_unmap(buf, &map);
     return GST_PAD_PROBE_OK;
@@ -79,7 +80,7 @@ int main(int argc, char* argv[]) {
 
     int fb_port = rtp_port + 1;
     printf("======================================================================\n");
-    printf("H.264 + GCC Demo (razor GCC v3.0)\n");
+    printf("H.264 + GCC Demo (razor GCC v4.0)\n");
     printf("  Duration: %ds | Bitrate: %d kbps | Port: %d\n", duration, bitrate, rtp_port);
     printf("======================================================================\n\n");
 
@@ -92,15 +93,50 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Razor sender
-    razor::Sender razor_tx([&](uint32_t br, uint8_t loss, uint32_t rtt) {
-        printf("  [RAZOR] bitrate=%u kbps loss=%u rtt=%u\n", br, loss, rtt);
+    // Razor sender with loss-based adaptation
+    int current_br = bitrate;
+    double smoothed_loss = 0.0;
+    GstElement* enc_ref = nullptr;  // set after encoder is created
+    razor::Sender razor_tx([&](uint32_t br_kbps, uint8_t loss, uint32_t rtt) {
+        // Razor's estimate as base
+        int br = static_cast<int>(br_kbps);
+        if (br > 8000) br = 8000;
+        if (br < 100) br = 100;
+
+        // Loss-based reduction
+        double instant_loss = loss / 255.0;
+        smoothed_loss = 0.3 * instant_loss + 0.7 * smoothed_loss;
+        if (smoothed_loss > 0.02) {
+            double factor = 1.0 - (smoothed_loss - 0.02) * 2.0;
+            if (factor < 0.3) factor = 0.3;
+            br = static_cast<int>(br * factor);
+        }
+        if (br > 8000) br = 8000;
+        if (br < 100) br = 100;
+
+        // Smooth transition: max 20% change per step
+        int diff = br - current_br;
+        int max_step = current_br / 5;
+        if (max_step < 100) max_step = 100;
+        if (diff > max_step) br = current_br + max_step;
+        else if (diff < -max_step) br = current_br - max_step;
+
+        if (br != current_br) {
+            g_object_set(enc_ref, "bitrate", br, nullptr);
+            printf("  [RAZOR] %d -> %d kbps (loss=%.1f%% rtt=%u)\n",
+                   current_br, br, smoothed_loss * 100, rtt);
+            current_br = br;
+        }
     });
     razor_tx.set_bitrates(200, bitrate, 8000);
 
-    // Razor receiver — sends feedback via channel
+    // Razor receiver — sends feedback via channel with RTT timestamps
+    std::atomic<uint32_t> last_rx_ts_ms{0};
     razor::Receiver razor_rx([&](const uint8_t* data, int size) {
-        receiver_fb.send_feedback(0, 0, data, size);
+        uint32_t now_ms = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
+        receiver_fb.send_feedback(0, 0, last_rx_ts_ms.load(), now_ms, data, size);
     });
 
     // Receiver pipeline
@@ -121,6 +157,8 @@ int main(int argc, char* argv[]) {
     g_object_set(rx_sink, "sync", FALSE, "silent", TRUE, nullptr);
     gst_bin_add_many(GST_BIN(rx_pipeline), rx_udpsrc, rx_depay, rx_parser, rx_decoder, rx_convert, rx_sink, nullptr);
     gst_element_link_many(rx_udpsrc, rx_depay, rx_parser, rx_decoder, rx_convert, rx_sink, nullptr);
+    // NOTE: On GStreamer 1.16, decoder may stall under heavy loss.
+    // The pipeline still works; fakesink drops frames silently.
 
     // Sender pipeline
     GstElement *tx_pipeline, *tx_src, *tx_conv, *tx_enc, *tx_parser, *tx_pay, *tx_sink;
@@ -135,6 +173,7 @@ int main(int argc, char* argv[]) {
     g_object_set(tx_src, "is-live", TRUE, "pattern", 1, nullptr);
     g_object_set(tx_enc, "tune", 0x4, "speed-preset", 1, "bitrate", bitrate,
         "key-int-max", 60, "bframes", 0, "threads", 2, "byte-stream", TRUE, nullptr);
+    enc_ref = tx_enc;  // connect to razor callback for dynamic adjustment
     g_object_set(tx_pay, "pt", 96, "mtu", 1400, nullptr);
     g_object_set(tx_sink, "host", "127.0.0.1", "port", rtp_port, "sync", FALSE, nullptr);
     gst_bin_add_many(GST_BIN(tx_pipeline), tx_src, tx_conv, tx_enc, tx_parser, tx_pay, tx_sink, nullptr);
@@ -148,7 +187,7 @@ int main(int argc, char* argv[]) {
     uint16_t tx_seq = 0, rx_seq = 0;
     uint64_t rx_pkt_count = 0;
     TxProbeData tx_pd = { &tx_seq };
-    RxProbeData rx_pd = { &razor_rx, &rx_seq, &rx_pkt_count };
+    RxProbeData rx_pd = { &razor_rx, &rx_seq, &rx_pkt_count, &last_rx_ts_ms };
 
     GstPad* tx_src_pad = gst_element_get_static_pad(tx_pay, "src");
     gst_pad_add_probe(tx_src_pad, GST_PAD_PROBE_TYPE_BUFFER, rtp_out_probe, &tx_pd, nullptr);
@@ -193,6 +232,16 @@ int main(int argc, char* argv[]) {
         gcc::FeedbackChannel::ReceivedFeedback fb;
         if (sender_fb.poll(fb)) {
             fb_count++;
+            // Estimate RTT from feedback timestamps
+            if (fb.rx_ts_ms > 0 && fb.fb_ts_ms > 0) {
+                uint32_t now_ms = static_cast<uint32_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
+                uint32_t rtt_ms = now_ms - fb.rx_ts_ms;
+                if (rtt_ms > 0 && rtt_ms < 5000) {
+                    razor_tx.update_rtt(rtt_ms);
+                }
+            }
             if (fb.razor_size > 0) {
                 razor_tx.on_feedback(fb.razor_data, fb.razor_size);
             }

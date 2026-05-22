@@ -34,22 +34,24 @@
 
 namespace gcc {
 
-// ── Feedback Packet Protocol v2 ────────────────────────────────────
-//  Header: 10 bytes fixed
+// ── Feedback Packet Protocol v3 ────────────────────────────────────
+//  Header: 18 bytes fixed (adds RTT estimation timestamps)
 //  Payload: variable-length razor feedback (0-256 bytes)
 
 #pragma pack(push, 1)
 struct FeedbackHeader {
     uint8_t  magic;           // 0xCC
-    uint8_t  version;         // 2 = razor
+    uint8_t  version;         // 3 = razor + RTT
     uint16_t seq;             // latest RTP seq
     uint8_t  loss_pct_x100;   // loss % * 100
     uint16_t fb_size;         // razor feedback data size
-    uint8_t  _pad[3];         // reserved
+    uint32_t rx_ts_ms;        // receiver: when packet was received (ms since epoch)
+    uint32_t fb_ts_ms;        // receiver: when feedback was sent (ms since epoch)
+    uint8_t  _pad[2];         // reserved
 };
 #pragma pack(pop)
 
-static constexpr int kFeedbackHeaderSize = 10;
+static constexpr int kFeedbackHeaderSize = 18;
 static constexpr int kMaxFeedbackPayload = 256;
 static constexpr int kMaxFeedbackPacketSize = kFeedbackHeaderSize + kMaxFeedbackPayload;
 
@@ -82,6 +84,66 @@ public:
 private:
     std::mutex mu_;
     std::unordered_map<uint16_t, uint64_t> send_times_;
+};
+
+// ── Loss Tracker (RTP sequence-based) ──────────────────────────────
+class LossTracker {
+public:
+    void on_packet(uint16_t seq) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_) {
+            max_seq_ = seq;
+            cycles_ = 0;
+            received_ = 1;
+            expected_ = 1;
+            initialized_ = true;
+            return;
+        }
+
+        // Handle wraparound
+        uint32_t ext_seq = seq;
+        if (seq < max_seq_ && (max_seq_ - seq) > 0x8000) {
+            cycles_ += 0x10000;
+        } else if (seq > max_seq_ && (seq - max_seq_) > 0x8000) {
+            if (cycles_ >= 0x10000) cycles_ -= 0x10000;
+        }
+
+        uint32_t ext_max = cycles_ + max_seq_;
+        uint32_t ext_new = cycles_ + seq;
+
+        if (ext_new > ext_max) {
+            expected_ += (ext_new - ext_max);
+            max_seq_ = seq;
+        }
+
+        received_++;
+    }
+
+    // Returns loss fraction 0-100 (percentage * 100, e.g. 5 = 0.05%)
+    uint8_t get_loss_pct_x100() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || expected_ == 0) return 0;
+        double loss = 1.0 - (double)received_ / (double)expected_;
+        if (loss < 0) loss = 0;
+        if (loss > 1) loss = 1;
+        // Return as 0-100 (percentage * 100)
+        return static_cast<uint8_t>(loss * 10000);
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mu_);
+        initialized_ = false;
+        received_ = 0;
+        expected_ = 0;
+    }
+
+private:
+    std::mutex mu_;
+    bool initialized_ = false;
+    uint16_t max_seq_ = 0;
+    uint32_t cycles_ = 0;
+    uint32_t received_ = 0;
+    uint32_t expected_ = 0;
 };
 
 // ── FeedbackChannel ────────────────────────────────────────────────
@@ -137,14 +199,18 @@ public:
     }
 
     // ── Receiver side: send feedback ──
-    void send_feedback(uint16_t seq, uint8_t loss_pct, const uint8_t* razor_data, int razor_size) {
+    void send_feedback(uint16_t seq, uint8_t loss_pct,
+                       uint32_t rx_ts_ms, uint32_t fb_ts_ms,
+                       const uint8_t* razor_data, int razor_size) {
         uint8_t buf[kMaxFeedbackPacketSize];
         FeedbackHeader* hdr = reinterpret_cast<FeedbackHeader*>(buf);
         hdr->magic = 0xCC;
-        hdr->version = 2;
+        hdr->version = 3;
         hdr->seq = seq;
         hdr->loss_pct_x100 = loss_pct;
         hdr->fb_size = static_cast<uint16_t>(razor_size);
+        hdr->rx_ts_ms = rx_ts_ms;
+        hdr->fb_ts_ms = fb_ts_ms;
         memset(hdr->_pad, 0, sizeof(hdr->_pad));
 
         int total = kFeedbackHeaderSize;
@@ -165,6 +231,8 @@ public:
     struct ReceivedFeedback {
         uint16_t seq;
         uint8_t  loss_pct;
+        uint32_t rx_ts_ms;      // when receiver got the packet
+        uint32_t fb_ts_ms;      // when receiver sent feedback
         uint8_t  razor_data[kMaxFeedbackPayload];
         int      razor_size;
     };
@@ -200,7 +268,7 @@ private:
             if (n < kFeedbackHeaderSize) continue;
 
             const FeedbackHeader* hdr = reinterpret_cast<const FeedbackHeader*>(buf);
-            if (hdr->magic != 0xCC || hdr->version != 2) continue;
+            if (hdr->magic != 0xCC || (hdr->version != 2 && hdr->version != 3)) continue;
 
             int fb_size = hdr->fb_size;
             if (fb_size > kMaxFeedbackPayload) continue;
@@ -209,6 +277,8 @@ private:
             std::lock_guard<std::mutex> lock(rx_mutex_);
             rx_latest_.seq = hdr->seq;
             rx_latest_.loss_pct = hdr->loss_pct_x100;
+            rx_latest_.rx_ts_ms = hdr->rx_ts_ms;
+            rx_latest_.fb_ts_ms = hdr->fb_ts_ms;
             rx_latest_.razor_size = fb_size;
             if (fb_size > 0) {
                 memcpy(rx_latest_.razor_data, buf + kFeedbackHeaderSize, fb_size);

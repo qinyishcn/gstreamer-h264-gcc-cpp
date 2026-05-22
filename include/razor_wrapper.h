@@ -2,6 +2,9 @@
 /**
  * C++ Wrapper for razor GCC library (yuanrongxi/razor)
  * Uses razor as the bandwidth estimator; GStreamer handles actual packet transmission.
+ *
+ * NOTE: razor API uses bps (bits per second) internally.
+ * This wrapper converts kbps <-> bps at the boundary.
  */
 #include <cstdint>
 #include <cstring>
@@ -13,6 +16,8 @@ extern "C" {
 }
 
 namespace razor {
+
+static constexpr uint32_t kBpsPerKbps = 1000;
 
 // Feedback data buffer (razor feedback is variable-length binary)
 struct FeedbackData {
@@ -30,17 +35,16 @@ public:
             0,  // gcc_congestion
             0,  // no padding
             this,
-            [](void* trigger, uint32_t bitrate, uint8_t loss, uint32_t rtt) {
+            [](void* trigger, uint32_t bitrate_bps, uint8_t loss, uint32_t rtt) {
                 auto* self = static_cast<Sender*>(trigger);
-                if (self->bitrate_cb_) self->bitrate_cb_(bitrate, loss, rtt);
+                // Convert bps -> kbps for the callback
+                if (self->bitrate_cb_)
+                    self->bitrate_cb_(bitrate_bps / kBpsPerKbps, loss, rtt);
             },
             nullptr,  // handler (unused, no pacer)
             nullptr,  // pace_send_cb (unused, GStreamer sends)
             0         // queue_ms (unused)
         );
-        if (sender_) {
-            sender_->set_bitrates(sender_, 200, 2000, 8000);
-        }
     }
 
     ~Sender() {
@@ -64,9 +68,20 @@ public:
         if (sender_) sender_->on_feedback(sender_, const_cast<uint8_t*>(data), size);
     }
 
-    // Update bitrate range
+    // Update RTT (milliseconds) — call this when you have a real RTT measurement
+    void update_rtt(uint32_t rtt_ms) {
+        if (sender_) sender_->update_rtt(sender_, static_cast<int32_t>(rtt_ms));
+    }
+
+    // Update bitrate range (all parameters in kbps)
     void set_bitrates(uint32_t min_kbps, uint32_t start_kbps, uint32_t max_kbps) {
-        if (sender_) sender_->set_bitrates(sender_, min_kbps, start_kbps, max_kbps);
+        if (sender_) {
+            // Convert kbps -> bps for razor API
+            sender_->set_bitrates(sender_,
+                min_kbps * kBpsPerKbps,
+                start_kbps * kBpsPerKbps,
+                max_kbps * kBpsPerKbps);
+        }
     }
 
 private:
@@ -82,8 +97,8 @@ public:
         feedback_cb_ = send_feedback_cb;
         receiver_ = razor_receiver_create(
             0,  // gcc_congestion
-            200,   // min_bitrate
-            8000,  // max_bitrate
+            200 * kBpsPerKbps,   // min_bitrate (bps)
+            8000 * kBpsPerKbps,  // max_bitrate (bps)
             12,    // packet_header_size (RTP header)
             this,
             [](void* handler, const uint8_t* payload, int payload_size) {
@@ -107,6 +122,11 @@ public:
     // Notify razor of a received packet (remb=1 for delay-based estimation)
     void on_received(uint16_t transport_seq, uint32_t timestamp, size_t size) {
         if (receiver_) receiver_->on_received(receiver_, transport_seq, timestamp, size, 1);
+    }
+
+    // Update RTT (milliseconds)
+    void update_rtt(uint32_t rtt_ms) {
+        if (receiver_) receiver_->update_rtt(receiver_, static_cast<int32_t>(rtt_ms));
     }
 
 private:

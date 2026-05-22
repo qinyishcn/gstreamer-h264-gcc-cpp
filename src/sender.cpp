@@ -75,7 +75,7 @@ int main(int argc, char* argv[]) {
     int feedback_port = cfg.rtp_port + 1;
 
     printf("============================================================\n");
-    printf("H.264 + GCC Video Sender (razor GCC v3.0)\n");
+    printf("H.264 + GCC Video Sender (razor GCC v4.0)\n");
     printf("============================================================\n");
     printf("  Target:       %s:%d\n", cfg.host, cfg.rtp_port);
     printf("  Bitrate:      %d kbps\n", cfg.bitrate);
@@ -251,6 +251,19 @@ int main(int argc, char* argv[]) {
             feedback_count++;
             last_fb_time = std::chrono::steady_clock::now();
             printed_fb = false;
+
+            // Estimate RTT from feedback timestamps
+            if (fb.rx_ts_ms > 0 && fb.fb_ts_ms > 0) {
+                uint32_t now_ms = static_cast<uint32_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
+                // RTT ≈ time from receiver got packet to sender got feedback
+                // (receiver_delay + network_delay) * 2
+                uint32_t rtt_ms = now_ms - fb.rx_ts_ms;
+                if (rtt_ms > 0 && rtt_ms < 5000) {
+                    razor_sender.update_rtt(rtt_ms);
+                }
+            }
 
             // Feed razor feedback to razor
             if (fb.razor_size > 0) {

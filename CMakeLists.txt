@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.10)
 project(gstreamer-h264-gcc VERSION 4.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 14)
-# v4.0.0: Loss-based bitrate adaptation via razor feedback
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
@@ -61,6 +60,6 @@ message(STATUS "")
 message(STATUS "=== Build Configuration ===")
 message(STATUS "  C++ standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "  GStreamer:     ${GST_VERSION}")
-message(STATUS "  Version:       3.0.0 (razor GCC integration)")
+message(STATUS "  Version:       4.0.0 (razor GCC + loss-based adaptation)")
 message(STATUS "===========================")
 message(STATUS "")

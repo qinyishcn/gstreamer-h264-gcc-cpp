@@ -31,6 +31,8 @@ struct ReceiverProbeData {
     razor::Receiver* razor_rx;
     uint16_t* last_seq;
     uint64_t* total_rx_packets;
+    gcc::LossTracker* loss_tracker;
+    std::atomic<uint32_t>* last_rx_ts_ms;
 };
 
 static GstPadProbeReturn rtp_in_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data) {
@@ -44,11 +46,15 @@ static GstPadProbeReturn rtp_in_probe(GstPad*, GstPadProbeInfo* info, gpointer u
     if (parse_rtp_seq(map.data, map.size, seq)) {
         *d->last_seq = seq;
         (*d->total_rx_packets)++;
-        // Notify razor of received packet
-        // timestamp = 0 (razor computes inter-arrival internally)
-        uint32_t ts = static_cast<uint32_t>(
+        // Record receive timestamp for RTT estimation
+        uint32_t now_ms = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
+        d->last_rx_ts_ms->store(now_ms);
+        // Track loss from RTP sequence numbers
+        if (d->loss_tracker) d->loss_tracker->on_packet(seq);
+        // Notify razor of received packet with real timestamp
+        uint32_t ts = now_ms;
         d->razor_rx->on_received(seq, ts, map.size);
     }
 
@@ -84,7 +90,7 @@ int main(int argc, char* argv[]) {
     int feedback_port = cfg.rtp_port + 1;
 
     printf("============================================================\n");
-    printf("H.264 + GCC Video Receiver (razor GCC v3.0)\n");
+    printf("H.264 + GCC Video Receiver (razor GCC v4.0)\n");
     printf("============================================================\n");
     printf("  RTP port:       %d\n", cfg.rtp_port);
     printf("  Feedback port:  %s:%d\n", cfg.sender_host, feedback_port);
@@ -92,18 +98,22 @@ int main(int argc, char* argv[]) {
 
     // ── Feedback channel (sends to sender) ──
     gcc::FeedbackChannel feedback(cfg.sender_host, feedback_port, false);
+    gcc::LossTracker loss_tracker;
     if (!feedback.start()) {
         fprintf(stderr, "ERROR: Failed to start feedback channel\n");
         return 1;
     }
 
     // ── Razor receiver (generates GCC feedback) ──
-    // The send_feedback callback is called by razor when it has feedback ready
+    uint16_t last_feedback_seq = 0;
+    std::atomic<uint32_t> last_rx_ts_ms{0};
     razor::Receiver razor_rx([&](const uint8_t* data, int size) {
-        // Send razor's feedback to sender via UDP
-        // We need the latest seq and loss info
-        // razor provides the feedback payload; we wrap it in our protocol
-        feedback.send_feedback(0, 0, data, size);
+        uint8_t loss_pct_x100 = loss_tracker.get_loss_pct_x100();
+        uint32_t now_ms = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
+        feedback.send_feedback(last_feedback_seq, loss_pct_x100,
+                               last_rx_ts_ms.load(), now_ms, data, size);
     });
     if (!razor_rx.is_valid()) {
         fprintf(stderr, "ERROR: Failed to create razor receiver\n");
@@ -143,7 +153,7 @@ int main(int argc, char* argv[]) {
     // ── Pad probes ──
     uint16_t last_rtp_seq = 0;
     uint64_t total_rx_packets = 0;
-    ReceiverProbeData probe_data = { &razor_rx, &last_rtp_seq, &total_rx_packets };
+    ReceiverProbeData probe_data = { &razor_rx, &last_rtp_seq, &total_rx_packets, &loss_tracker, &last_rx_ts_ms };
 
     GstPad* udpsrc_src = gst_element_get_static_pad(udpsrc, "src");
     if (udpsrc_src) {
