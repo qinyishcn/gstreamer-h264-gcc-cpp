@@ -108,6 +108,32 @@ if(BUILD_TESTING)
         COMMAND test_razor_feedback
                 ${CMAKE_SOURCE_DIR}/vendor/razor/cc/sender_congestion_controller.c
     )
+
+    add_executable(
+        test_demo_source_contract
+        tests/test_demo_source_contract.cpp
+    )
+    target_include_directories(
+        test_demo_source_contract PRIVATE ${CMAKE_SOURCE_DIR}/tests
+    )
+    add_test(
+        NAME demo_source_contract
+        COMMAND test_demo_source_contract ${CMAKE_SOURCE_DIR}/src/demo.cpp
+    )
+
+    add_executable(test_demo_runtime tests/test_demo_runtime.cpp)
+    target_include_directories(
+        test_demo_runtime PRIVATE ${CMAKE_SOURCE_DIR}/tests
+    )
+    if(WIN32)
+        target_link_libraries(test_demo_runtime ws2_32)
+    endif()
+    add_dependencies(test_demo_runtime demo)
+    add_test(
+        NAME demo_runtime
+        COMMAND test_demo_runtime $<TARGET_FILE:demo>
+    )
+    set_tests_properties(demo_runtime PROPERTIES TIMEOUT 20)
 endif()
 
 add_executable(sender src/sender.cpp)
