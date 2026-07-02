@@ -47,6 +47,7 @@ add_library(gcc_support STATIC src/rtp_packet.cpp)
 target_include_directories(gcc_support PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_sources(gcc_support PRIVATE
     src/feedback_packet.cpp
+    src/rate_policy.cpp
     src/transport_sender.cpp
 )
 target_link_libraries(gcc_support PUBLIC Threads::Threads)
@@ -78,6 +79,14 @@ if(BUILD_TESTING)
     )
     target_link_libraries(test_transport_sender gcc_support)
     add_test(NAME transport_sender COMMAND test_transport_sender)
+
+    add_executable(test_rate_policy tests/test_rate_policy.cpp)
+    target_include_directories(test_rate_policy PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_rate_policy gcc_support)
+    add_test(NAME rate_policy COMMAND test_rate_policy)
 
     add_executable(test_razor_feedback tests/test_razor_feedback.cpp)
     target_include_directories(test_razor_feedback PRIVATE
