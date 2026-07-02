@@ -45,13 +45,24 @@ target_link_libraries(gcc_controller ${GST_LIBRARIES})
 
 add_library(gcc_support STATIC src/rtp_packet.cpp)
 target_include_directories(gcc_support PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_sources(gcc_support PRIVATE src/transport_sender.cpp)
+target_sources(gcc_support PRIVATE
+    src/feedback_packet.cpp
+    src/transport_sender.cpp
+)
 target_link_libraries(gcc_support PUBLIC Threads::Threads)
 if(WIN32)
     target_link_libraries(gcc_support PUBLIC ws2_32)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(test_feedback_packet tests/test_feedback_packet.cpp)
+    target_include_directories(test_feedback_packet PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_feedback_packet gcc_support)
+    add_test(NAME feedback_packet COMMAND test_feedback_packet)
+
     add_executable(test_rtp_packet tests/test_rtp_packet.cpp)
     target_include_directories(test_rtp_packet PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -83,15 +94,15 @@ endif()
 
 add_executable(sender src/sender.cpp)
 target_include_directories(sender PRIVATE ${GST_INCLUDE_DIRS})
-target_link_libraries(sender ${GST_LIBRARIES} razor Threads::Threads)
+target_link_libraries(sender ${GST_LIBRARIES} razor gcc_support Threads::Threads)
 
 add_executable(receiver src/receiver.cpp)
 target_include_directories(receiver PRIVATE ${GST_INCLUDE_DIRS})
-target_link_libraries(receiver ${GST_LIBRARIES} razor Threads::Threads)
+target_link_libraries(receiver ${GST_LIBRARIES} razor gcc_support Threads::Threads)
 
 add_executable(demo src/demo.cpp)
 target_include_directories(demo PRIVATE ${GST_INCLUDE_DIRS})
-target_link_libraries(demo ${GST_LIBRARIES} razor Threads::Threads)
+target_link_libraries(demo ${GST_LIBRARIES} razor gcc_support Threads::Threads)
 
 install(TARGETS sender receiver demo RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
