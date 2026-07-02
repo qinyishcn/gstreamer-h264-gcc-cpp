@@ -1,4 +1,5 @@
 build/
+.worktrees/
 cmake-build-*/
 *.o
 *.a
