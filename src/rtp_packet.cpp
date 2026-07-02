@@ -10,7 +10,8 @@ constexpr size_t kFixedHeaderSize = 12;
 constexpr size_t kProbeMagicSize = 4;
 constexpr size_t kMinimumProbeSize =
     kFixedHeaderSize + kProbeMagicSize + 1;
-constexpr size_t kMaximumUdpPayloadSize = 1472;
+constexpr size_t kMaximumProbeSize =
+    kFixedHeaderSize + static_cast<size_t>(UINT8_MAX);
 constexpr uint8_t kProbeMagic[kProbeMagicSize] = {'G', 'C', 'C', 'P'};
 
 uint16_t ReadUint16(const uint8_t* data) {
@@ -90,18 +91,24 @@ bool ParseRtpHeader(const uint8_t* data, size_t size, RtpHeader& header) {
     return true;
 }
 
-bool RewriteRtpSequence(std::vector<uint8_t>& packet, uint16_t sequence) {
+bool RewriteRtpSequence(
+    uint8_t* data, size_t size, uint16_t sequence) {
     RtpHeader header;
-    if (!ParseRtpHeader(packet.data(), packet.size(), header)) {
+    if (!ParseRtpHeader(data, size, header)) {
         return false;
     }
-    WriteUint16(packet.data() + 2, sequence);
+    WriteUint16(data + 2, sequence);
     return true;
+}
+
+bool RewriteRtpSequence(std::vector<uint8_t>& packet, uint16_t sequence) {
+    return RewriteRtpSequence(
+        packet.data(), packet.size(), sequence);
 }
 
 std::vector<uint8_t> BuildProbeRtpPacket(
     const RtpHeader& header, uint16_t sequence, size_t size) {
-    if (size < kMinimumProbeSize || size > kMaximumUdpPayloadSize) {
+    if (size < kMinimumProbeSize || size > kMaximumProbeSize) {
         return {};
     }
 
@@ -113,7 +120,8 @@ std::vector<uint8_t> BuildProbeRtpPacket(
     WriteUint32(packet.data() + 8, header.ssrc);
     std::copy(kProbeMagic, kProbeMagic + kProbeMagicSize,
               packet.begin() + kFixedHeaderSize);
-    packet.back() = 1;
+    packet.back() =
+        static_cast<uint8_t>(size - kFixedHeaderSize);
     return packet;
 }
 
@@ -124,13 +132,95 @@ bool IsProbeRtpPacket(const uint8_t* data, size_t size) {
     }
 
     const size_t padding_size = data[size - 1];
-    if (kProbeMagicSize > size - header.header_size ||
-        padding_size > size - header.header_size - kProbeMagicSize) {
+    if (size - header.header_size != padding_size ||
+        padding_size < kProbeMagicSize + 1U) {
         return false;
     }
     return std::equal(
         kProbeMagic, kProbeMagic + kProbeMagicSize,
         data + header.header_size);
+}
+
+void MediaSequenceTranslator::OnProbe(uint16_t transport_sequence) {
+    const int64_t extended = Extend(transport_sequence);
+    PruneProbes();
+
+    if (media_initialized_ && extended <= highest_media_sequence_) {
+        return;
+    }
+    if (extended < OldestTranslatable()) {
+        return;
+    }
+
+    const auto position =
+        std::lower_bound(probes_.begin(), probes_.end(), extended);
+    if (position == probes_.end() || *position != extended) {
+        probes_.insert(position, extended);
+    }
+}
+
+bool MediaSequenceTranslator::TranslateMedia(
+    uint16_t transport_sequence, uint16_t& media_sequence) {
+    const int64_t extended = Extend(transport_sequence);
+    PruneProbes();
+    if (extended < OldestTranslatable()) {
+        return false;
+    }
+    if (!media_initialized_ || extended > highest_media_sequence_) {
+        media_initialized_ = true;
+        highest_media_sequence_ = extended;
+    }
+
+    const auto position =
+        std::lower_bound(probes_.begin(), probes_.end(), extended);
+    const uint64_t probe_count =
+        retired_probe_count_ +
+        static_cast<uint64_t>(position - probes_.begin());
+    media_sequence = static_cast<uint16_t>(
+        transport_sequence - static_cast<uint16_t>(probe_count));
+    return true;
+}
+
+int64_t MediaSequenceTranslator::Extend(uint16_t transport_sequence) {
+    const int64_t kSequenceRange = int64_t{1} << 16;
+    const int64_t kHalfRange = kSequenceRange / 2;
+    if (!transport_initialized_) {
+        transport_initialized_ = true;
+        highest_transport_sequence_ = transport_sequence;
+        return highest_transport_sequence_;
+    }
+
+    const int64_t epoch =
+        (highest_transport_sequence_ / kSequenceRange) * kSequenceRange;
+    int64_t extended =
+        epoch + static_cast<int64_t>(transport_sequence);
+    if (extended > highest_transport_sequence_) {
+        if (extended - highest_transport_sequence_ > kHalfRange) {
+            extended -= kSequenceRange;
+        }
+    } else if (highest_transport_sequence_ - extended > kHalfRange) {
+        if (extended <= INT64_MAX - kSequenceRange) {
+            extended += kSequenceRange;
+        }
+    }
+
+    if (extended > highest_transport_sequence_) {
+        highest_transport_sequence_ = extended;
+    }
+    return extended;
+}
+
+int64_t MediaSequenceTranslator::OldestTranslatable() const {
+    return highest_transport_sequence_ - (kReorderWindow - 1);
+}
+
+void MediaSequenceTranslator::PruneProbes() {
+    const int64_t retained_floor = OldestTranslatable();
+    const auto first_retained =
+        std::lower_bound(probes_.begin(), probes_.end(), retained_floor);
+    retired_probe_count_ +=
+        static_cast<uint64_t>(first_retained - probes_.begin());
+    probes_.erase(probes_.begin(), first_retained);
 }
 
 }  // namespace gcc

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "============================================================"
 echo " v4.0.0 GStreamer 1.16 Integration Test"
@@ -59,19 +59,33 @@ run_test() {
     sleep 1
 
     # Run sender
-    timeout $((duration + 5)) ./sender --host 127.0.0.1 --port $port \
-        --bitrate $bitrate --duration $duration 2>&1 | tee "$logfile"
+    set +e
+    timeout $((duration + 5)) ./sender --host 127.0.0.1 --port "$port" \
+        --bitrate "$bitrate" --duration "$duration" 2>&1 | tee "$logfile"
     local sender_rc=${PIPESTATUS[0]}
+    set -e
 
     sleep 2
-    kill $rx_pid 2>/dev/null || true
-    wait $rx_pid 2>/dev/null || true
+    kill "$rx_pid" 2>/dev/null || true
+    wait "$rx_pid" 2>/dev/null || true
     tc qdisc del dev lo root 2>/dev/null || true
 
+    if [ "$sender_rc" -ne 0 ]; then
+        echo "ERROR: sender exited with status $sender_rc"
+        echo "--- sender log tail ---"
+        tail -40 "$logfile"
+        return 1
+    fi
+
     # Analyze results
-    local fb_count=$(grep -c "Feedback received\|Bitrate adjusted" "$logfile" 2>/dev/null || echo 0)
-    local adjustments=$(grep -c "Bitrate adjusted" "$logfile" 2>/dev/null || echo 0)
-    local razor_lines=$(grep -c "RAZOR" "$logfile" 2>/dev/null || echo 0)
+    local fb_count
+    local adjustments
+    local razor_lines
+    fb_count=$(grep -c "Feedback received\|Bitrate adjusted" "$logfile" 2>/dev/null || true)
+    adjustments=$(grep -c "Bitrate adjusted" "$logfile" 2>/dev/null || true)
+    razor_lines=$(grep -c "RAZOR" "$logfile" 2>/dev/null || true)
+    local final_stats
+    final_stats=$(grep '^gcc_stats ' "$logfile" 2>/dev/null | tail -1 || true)
 
     echo ""
     echo "--- Results ---"
@@ -84,6 +98,25 @@ run_test() {
         echo "  ⚠ No bitrate adjustments"
     fi
     echo ""
+
+    if [ "$name" = "baseline" ]; then
+        local media_sent
+        local feedback_matched
+        media_sent=$(printf '%s\n' "$final_stats" |
+            sed -n 's/.* media_sent=\([0-9][0-9]*\).*/\1/p')
+        feedback_matched=$(printf '%s\n' "$final_stats" |
+            sed -n 's/.* feedback_matched=\([0-9][0-9]*\).*/\1/p')
+        if [ -z "$media_sent" ] || [ -z "$feedback_matched" ] ||
+           [ "$media_sent" -le 100 ] || [ "$feedback_matched" -le 50 ]; then
+            echo "ERROR: baseline final gcc_stats missing or below thresholds"
+            echo "  required: media_sent>100 feedback_matched>50"
+            echo "  observed: ${final_stats:-<missing>}"
+            echo "--- sender log tail ---"
+            tail -40 "$logfile"
+            return 1
+        fi
+    fi
+
     rm -f "$logfile"
 }
 
@@ -114,7 +147,9 @@ port=$((17000 + RANDOM % 1000))
 rx_pid=$!
 sleep 1
 
-./sender --host 127.0.0.1 --port $port --bitrate 2000 --duration 30 &
+variable_log="/tmp/test_variable_delay.log"
+./sender --host 127.0.0.1 --port "$port" \
+    --bitrate 2000 --duration 30 > "$variable_log" 2>&1 &
 sender_pid=$!
 
 sleep 10
@@ -125,10 +160,22 @@ sleep 10
 tc qdisc change dev lo root handle 1: netem delay 50ms 10ms loss 3%
 echo "[20s] Changed to: 50ms 10ms 3%"
 
-wait $sender_pid 2>/dev/null || true
+set +e
+wait "$sender_pid"
+sender_rc=$?
+set -e
+cat "$variable_log"
 sleep 2
-kill $rx_pid 2>/dev/null || true
+kill "$rx_pid" 2>/dev/null || true
+wait "$rx_pid" 2>/dev/null || true
 tc qdisc del dev lo root 2>/dev/null || true
+if [ "$sender_rc" -ne 0 ]; then
+    echo "ERROR: variable_delay sender exited with status $sender_rc"
+    echo "--- sender log tail ---"
+    tail -40 "$variable_log"
+    exit 1
+fi
+rm -f "$variable_log"
 echo ""
 
 echo "============================================================"
