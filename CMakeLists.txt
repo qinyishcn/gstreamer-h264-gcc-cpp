@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(gstreamer-h264-gcc VERSION 4.0.0 LANGUAGES C CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -40,6 +42,19 @@ add_compile_options(${GST_CFLAGS_OTHER})
 add_library(gcc_controller STATIC src/gcc_controller.cpp)
 target_include_directories(gcc_controller PUBLIC ${GST_INCLUDE_DIRS})
 target_link_libraries(gcc_controller ${GST_LIBRARIES})
+
+add_library(gcc_support STATIC src/rtp_packet.cpp)
+target_include_directories(gcc_support PUBLIC ${CMAKE_SOURCE_DIR}/include)
+
+if(BUILD_TESTING)
+    add_executable(test_rtp_packet tests/test_rtp_packet.cpp)
+    target_include_directories(test_rtp_packet PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_rtp_packet gcc_support)
+    add_test(NAME rtp_packet COMMAND test_rtp_packet)
+endif()
 
 add_executable(sender src/sender.cpp)
 target_include_directories(sender PRIVATE ${GST_INCLUDE_DIRS})
