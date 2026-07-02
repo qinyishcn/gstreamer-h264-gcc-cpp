@@ -45,6 +45,11 @@ target_link_libraries(gcc_controller ${GST_LIBRARIES})
 
 add_library(gcc_support STATIC src/rtp_packet.cpp)
 target_include_directories(gcc_support PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_sources(gcc_support PRIVATE src/transport_sender.cpp)
+target_link_libraries(gcc_support PUBLIC Threads::Threads)
+if(WIN32)
+    target_link_libraries(gcc_support PUBLIC ws2_32)
+endif()
 
 if(BUILD_TESTING)
     add_executable(test_rtp_packet tests/test_rtp_packet.cpp)
@@ -54,6 +59,14 @@ if(BUILD_TESTING)
     )
     target_link_libraries(test_rtp_packet gcc_support)
     add_test(NAME rtp_packet COMMAND test_rtp_packet)
+
+    add_executable(test_transport_sender tests/test_transport_sender.cpp)
+    target_include_directories(test_transport_sender PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_transport_sender gcc_support)
+    add_test(NAME transport_sender COMMAND test_transport_sender)
 
     add_executable(test_razor_feedback tests/test_razor_feedback.cpp)
     target_include_directories(test_razor_feedback PRIVATE
