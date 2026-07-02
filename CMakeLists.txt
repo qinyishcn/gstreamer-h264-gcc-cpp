@@ -54,6 +54,18 @@ if(BUILD_TESTING)
     )
     target_link_libraries(test_rtp_packet gcc_support)
     add_test(NAME rtp_packet COMMAND test_rtp_packet)
+
+    add_executable(test_razor_feedback tests/test_razor_feedback.cpp)
+    target_include_directories(test_razor_feedback PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_razor_feedback razor Threads::Threads)
+    add_test(
+        NAME razor_feedback
+        COMMAND test_razor_feedback
+                ${CMAKE_SOURCE_DIR}/vendor/razor/cc/sender_congestion_controller.c
+    )
 endif()
 
 add_executable(sender src/sender.cpp)

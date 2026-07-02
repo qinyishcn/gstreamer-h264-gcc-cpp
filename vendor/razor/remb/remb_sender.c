@@ -8,6 +8,8 @@
 #define remb_rate_wnd_size		2000
 #define remb_rate_scale			8000
 
+#define k_max_feedback_size		1472
+
 static void sender_remb_on_change_bitrate(remb_sender_t* cc, uint32_t bitrate, uint8_t fraction_loss, uint32_t rtt)
 {
 	razor_info("remb sender change bitrate, bitrate = %uKB/s\n", bitrate / 8000);
@@ -117,10 +119,15 @@ void remb_sender_update_rtt(remb_sender_t* s, int32_t rtt)
 
 void remb_sender_on_feedback(remb_sender_t* s, uint8_t* feedback, int feedback_size)
 {
-	int64_t now_ts = GET_SYS_MS();
+	int64_t now_ts;
 	int32_t bitrate;
 	feedback_msg_t msg;
 
+	if (s == NULL || feedback == NULL || feedback_size <= 0
+		|| feedback_size > k_max_feedback_size)
+		return;
+
+	now_ts = GET_SYS_MS();
 	bitrate = rate_stat_rate(&s->rate, now_ts);
 
 	bin_stream_resize(&s->strm, feedback_size);
@@ -128,7 +135,8 @@ void remb_sender_on_feedback(remb_sender_t* s, uint8_t* feedback, int feedback_s
 	memcpy(s->strm.data, feedback, feedback_size);
 	s->strm.used = feedback_size;
 
-	feedback_msg_decode(&s->strm, &msg);
+	if (feedback_msg_decode(&s->strm, &msg) != 0)
+		return;
 
 	if ((msg.flag & loss_info_msg) == loss_info_msg){
 		s->loss_fraction = msg.fraction_loss;

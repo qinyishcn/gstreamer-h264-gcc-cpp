@@ -118,7 +118,8 @@ void sender_on_feedback(sender_cc_t* cc, uint8_t* feedback, int feedback_size)
 	int64_t now_ts;
 	feedback_msg_t msg;
 
-	if (feedback_size > k_max_feedback_size)
+	if (cc == NULL || feedback == NULL || feedback_size <= 0
+		|| feedback_size > k_max_feedback_size)
 		return;
 
 	bin_stream_resize(&cc->strm, feedback_size);
@@ -127,7 +128,8 @@ void sender_on_feedback(sender_cc_t* cc, uint8_t* feedback, int feedback_size)
 	cc->strm.used = feedback_size;
 
 	/*解码得到反馈序列*/
-	feedback_msg_decode(&cc->strm, &msg);
+	if (feedback_msg_decode(&cc->strm, &msg) != 0)
+		return;
 
 	now_ts = GET_SYS_MS();
 
@@ -140,37 +142,6 @@ void sender_on_feedback(sender_cc_t* cc, uint8_t* feedback, int feedback_size)
 		if (cc->was_in_alr == 0 && cur_alr != 0){
 			ack_estimator_set_alrended(cc->ack, now_ts);
 		}
-		cc->was_in_alr = cur_alr;
-
-		/*进行远端接收码率评估*/
-		ack_estimator_incoming(cc->ack, cc->adapter.packets, cc->adapter.num);
-
-		/*根据延迟状态进行发送端拥塞控制判断,并评估最新的发送码率*/
-		init_bwe_result_null(bwe_result);
-		bwe_result = delay_bwe_incoming(cc->bwe, cc->adapter.packets, cc->adapter.num, ack_estimator_bitrate_bps(cc->ack), now_ts);
-
-		/*进行码率调节*/
-		if (bwe_result.updated == 0)
-			bitrate_controller_on_basedelay_result(cc->bitrate_controller, bwe_result.updated, bwe_result.probe, bwe_result.bitrate, cc->bwe->detector->state);
-	}
-	/*处理remb*/
-	if ((msg.flag & remb_msg) == remb_msg){
-		razor_debug("sender remb = %ubps\n", msg.remb);
-		bitrate_controller_on_remb(cc->bitrate_controller, msg.remb);
-	}
-	/*处理loss info*/
-	if ((msg.flag & proxy_ts_msg) == proxy_ts_msg){
-		if (cc_feedback_on_feedback(&cc->adapter, &msg, now_ts) <= 0)
-			return;
-
-		cur_alr = pace_get_limited_start_time(cc->pacer) > 0 ? 0 : -1;
-		if (cc->was_in_alr == 0 && cur_alr != 0){
-			ack_estimator_set_alrended(cc->ack, now_ts);
-		}
-if ((msg.flag & loss_info_msg) == loss_info_msg){
-		razor_debug("sender receive loss info, fraction_loss = %u, packets_num = %u\n", msg.fraction_loss, msg.packet_num);
-		bitrate_controller_on_report(cc->bitrate_controller, cc->rtt, now_ts, msg.fraction_loss, msg.packet_num, ack_estimator_bitrate_bps(cc->ack));
-	}
 		cc->was_in_alr = cur_alr;
 
 		/*进行远端接收码率评估*/

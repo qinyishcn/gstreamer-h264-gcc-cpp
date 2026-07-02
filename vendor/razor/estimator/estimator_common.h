@@ -88,7 +88,7 @@ typedef struct
 }feedback_msg_t;
 
 void	feedback_msg_encode(bin_stream_t* strm, feedback_msg_t* msg);
-void	feedback_msg_decode(bin_stream_t* strm, feedback_msg_t* msg);
+int		feedback_msg_decode(bin_stream_t* strm, feedback_msg_t* msg);
 
 #endif
 
