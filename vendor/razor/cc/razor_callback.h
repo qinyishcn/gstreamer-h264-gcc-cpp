@@ -34,6 +34,8 @@ typedef void(*sender_heartbeat_func)(razor_sender_t* sender);
 /*设置码率范围*/
 typedef void(*sender_set_bitrates)(razor_sender_t* sender, uint32_t min_bitrate, uint32_t start_bitrate, uint32_t max_bitrate);
 
+typedef void(*sender_set_pacing_rate_func)(razor_sender_t* sender, uint32_t bitrate);
+
 /*发送端增加一个待发送的报文*/
 typedef int(*sender_add_packet_func)(razor_sender_t* sender, uint32_t packet_id, int retrans, size_t size);
 
@@ -64,6 +66,8 @@ struct __razor_sender
 	sender_update_rtt_func			update_rtt;
 	sender_get_pacer_queue_ms_func	get_pacer_queue_ms;
 	sender_get_first_ts				get_first_timestamp;
+	/* Appended ABI slot; may be NULL for unsupported sender types. */
+	sender_set_pacing_rate_func		set_pacing_rate;
 };
 
 /*************************************接收端********************************************/

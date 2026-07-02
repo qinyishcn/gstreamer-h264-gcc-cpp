@@ -17,6 +17,7 @@ typedef struct
 	uint32_t			min_sender_bitrate_kpbs;
 	uint32_t			estimated_bitrate;
 	uint32_t			pacing_bitrate_kpbs;
+	uint32_t			pacing_factor_x100;
 
 	int64_t				last_update_ts;
 	int64_t				first_sent_ts;
@@ -36,6 +37,7 @@ void					pace_destroy(pace_sender_t* pace);
 
 void					pace_set_estimate_bitrate(pace_sender_t* pace, uint32_t bitrate_pbs);
 void					pace_set_bitrate_limits(pace_sender_t* pace, uint32_t min_sent_bitrate_pbs);
+void					pace_set_pacing_rate(pace_sender_t* pace, uint32_t bitrate_bps);
 
 int						pace_insert_packet(pace_sender_t* pace, uint32_t seq, int retrans, size_t size, int64_t now_ts);
 

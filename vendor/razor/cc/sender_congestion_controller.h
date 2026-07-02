@@ -28,6 +28,7 @@ typedef struct
 	ack_bitrate_estimator_t*	ack;						/*远端确认收到的数据带宽评估器*/
 	pace_sender_t*				pacer;						/*发送端的步长控制器*/
 	feedback_adapter_t			adapter;					/*处理反馈信息的适配器*/
+	uint64_t					matched_feedback_packets;
 
 	bin_stream_t				strm;
 
@@ -50,6 +51,7 @@ void							sender_on_feedback(sender_cc_t* cc, uint8_t* feedback, int feedback_s
 
 void							sender_cc_update_rtt(sender_cc_t* cc, int32_t rtt);
 void							sender_cc_set_bitrates(sender_cc_t* cc, uint32_t min_bitrate, uint32_t start_bitrate, uint32_t max_bitrate);
+void							sender_cc_set_pacing_rate(sender_cc_t* cc, uint32_t bitrate_bps);
 
 int64_t							sender_cc_get_pacer_queue_ms(sender_cc_t* cc);
 int64_t							sender_cc_get_first_packet_ts(sender_cc_t* cc);

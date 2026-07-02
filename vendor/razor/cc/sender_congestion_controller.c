@@ -29,7 +29,8 @@ sender_cc_t* sender_cc_create(void* trigger, bitrate_changed_func bitrate_cb, vo
 {
 	sender_cc_t* cc = calloc(1, sizeof(sender_cc_t));
 	cc->was_in_alr = -1;
-	cc->accepted_queue_ms = SU_MIN(queue_ms, k_max_queue_ms);
+	cc->accepted_queue_ms = queue_ms <= 0
+		? k_max_queue_ms : SU_MIN(queue_ms, k_max_queue_ms);
 
 	cc->rtt = 200;
 
@@ -137,6 +138,7 @@ void sender_on_feedback(sender_cc_t* cc, uint8_t* feedback, int feedback_size)
 	if ((msg.flag & proxy_ts_msg) == proxy_ts_msg){
 		if (cc_feedback_on_feedback(&cc->adapter, &msg, now_ts) <= 0)
 			return;
+		cc->matched_feedback_packets += cc->adapter.num;
 
 		cur_alr = pace_get_limited_start_time(cc->pacer) > 0 ? 0 : -1;
 		if (cc->was_in_alr == 0 && cur_alr != 0){
@@ -192,6 +194,11 @@ void sender_cc_set_bitrates(sender_cc_t* cc, uint32_t min_bitrate, uint32_t star
 
 
 	razor_info("set razor sender bitrates, min = %ubps, max = %ubps, start = %ubps\n", min_bitrate, max_bitrate, start_bitrate);
+}
+
+void sender_cc_set_pacing_rate(sender_cc_t* cc, uint32_t bitrate_bps)
+{
+	pace_set_pacing_rate(cc->pacer, bitrate_bps);
 }
 
 int64_t sender_cc_get_pacer_queue_ms(sender_cc_t* cc)

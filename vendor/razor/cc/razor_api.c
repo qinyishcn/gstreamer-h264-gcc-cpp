@@ -12,6 +12,7 @@
 #include "remb_receiver.h"
 #include "bbr_sender.h"
 #include "bbr_receiver.h"
+#include <string.h>
 
 static void razor_sender_heartbeat(razor_sender_t* sender)
 {
@@ -37,6 +38,12 @@ static void razor_sender_set_bitrates(razor_sender_t* sender, uint32_t min_bitra
 {
 	if (sender != NULL)
 		sender_cc_set_bitrates((sender_cc_t*)sender, min_bitrate, start_bitrate, max_bitrate);
+}
+
+static void razor_gcc_sender_set_pacing_rate(razor_sender_t* sender, uint32_t bitrate)
+{
+	if (sender != NULL)
+		sender_cc_set_pacing_rate((sender_cc_t*)sender, bitrate);
 }
 
 static void razor_bbr_sender_set_bitrates(razor_sender_t* sender, uint32_t min_bitrate, uint32_t start_bitrate, uint32_t max_bitrate)
@@ -189,6 +196,7 @@ razor_sender_t* razor_sender_create(int type, int padding, void* trigger, bitrat
 		cc->sender.add_packet = razor_sender_add_packet;
 		cc->sender.on_send = razor_sender_on_send;
 		cc->sender.set_bitrates = razor_sender_set_bitrates;
+		cc->sender.set_pacing_rate = razor_gcc_sender_set_pacing_rate;
 		cc->sender.update_rtt = razor_sender_update_rtt;
 		cc->sender.get_pacer_queue_ms = razor_sender_get_pacer_queue_ms;
 		cc->sender.on_feedback = razor_sender_on_feedback;
@@ -243,6 +251,34 @@ void razor_sender_destroy(razor_sender_t* sender)
 		else
 			remb_sender_destroy((remb_sender_t*)sender);
 	}
+}
+
+int razor_sender_set_pacing_rate(razor_sender_t* sender, uint32_t bitrate_bps)
+{
+	if (sender == NULL || sender->type != gcc_congestion
+		|| sender->set_pacing_rate == NULL)
+		return -1;
+
+	sender->set_pacing_rate(sender, bitrate_bps);
+	return 0;
+}
+
+int razor_sender_get_stats(razor_sender_t* sender, razor_sender_stats_t* stats)
+{
+	sender_cc_t* cc;
+
+	if (stats == NULL)
+		return -1;
+	memset(stats, 0, sizeof(*stats));
+	if (sender == NULL || sender->type != gcc_congestion)
+		return -1;
+
+	cc = (sender_cc_t*)sender;
+	stats->acked_bitrate_bps = ack_estimator_bitrate_bps(cc->ack);
+	stats->delay_state = cc->bwe->detector->state;
+	stats->matched_feedback_packets = cc->matched_feedback_packets;
+	stats->pacer_queue_ms = sender_cc_get_pacer_queue_ms(cc);
+	return 0;
 }
 /**********************************************************************************/
 static void razor_receiver_heartbeat(razor_receiver_t* receiver)
