@@ -7,6 +7,46 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+option(
+    ENABLE_SANITIZERS
+    "Enable address and undefined behavior sanitizers"
+    OFF
+)
+option(ENABLE_TSAN "Enable thread sanitizer" OFF)
+
+if(ENABLE_SANITIZERS AND ENABLE_TSAN)
+    message(FATAL_ERROR
+        "ENABLE_SANITIZERS and ENABLE_TSAN cannot be enabled together")
+endif()
+
+if(ENABLE_SANITIZERS OR ENABLE_TSAN)
+    if(WIN32 OR NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" OR
+       NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR
+            "Requested sanitizers require GNU or Clang on a non-Windows host")
+    endif()
+
+    if(ENABLE_SANITIZERS)
+        set(SANITIZER_COMPILE_FLAG "-fsanitize=address,undefined")
+        set(SANITIZER_LINK_FLAG "-fsanitize=address,undefined")
+    else()
+        set(SANITIZER_COMPILE_FLAG "-fsanitize=thread")
+        set(SANITIZER_LINK_FLAG "-fsanitize=thread")
+    endif()
+endif()
+
+add_library(project_sanitizers INTERFACE)
+if(ENABLE_SANITIZERS OR ENABLE_TSAN)
+    target_compile_options(project_sanitizers INTERFACE
+        ${SANITIZER_COMPILE_FLAG}
+        -fno-omit-frame-pointer
+    )
+    target_link_libraries(project_sanitizers INTERFACE
+        ${SANITIZER_LINK_FLAG}
+    )
+endif()
+link_libraries(project_sanitizers)
+
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
@@ -47,7 +87,9 @@ add_library(gcc_support STATIC src/rtp_packet.cpp)
 target_include_directories(gcc_support PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_sources(gcc_support PRIVATE
     src/feedback_packet.cpp
+    src/probe_budget.cpp
     src/probe_controller.cpp
+    src/rate_diagnostics.cpp
     src/rate_policy.cpp
     src/transport_sender.cpp
 )
@@ -97,6 +139,22 @@ if(BUILD_TESTING)
     target_link_libraries(test_probe_controller gcc_support)
     add_test(NAME probe_controller COMMAND test_probe_controller)
 
+    add_executable(test_probe_budget tests/test_probe_budget.cpp)
+    target_include_directories(test_probe_budget PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    add_test(NAME probe_budget COMMAND test_probe_budget)
+    target_link_libraries(test_probe_budget gcc_support)
+
+    add_executable(test_rate_diagnostics tests/test_rate_diagnostics.cpp)
+    target_include_directories(test_rate_diagnostics PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    add_test(NAME rate_diagnostics COMMAND test_rate_diagnostics)
+    target_link_libraries(test_rate_diagnostics gcc_support)
+
     add_executable(test_razor_feedback tests/test_razor_feedback.cpp)
     target_include_directories(test_razor_feedback PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -121,6 +179,17 @@ if(BUILD_TESTING)
         COMMAND test_demo_source_contract ${CMAKE_SOURCE_DIR}/src/demo.cpp
     )
 
+    add_executable(test_project_contract tests/test_project_contract.cpp)
+    target_include_directories(
+        test_project_contract PRIVATE ${CMAKE_SOURCE_DIR}/tests
+    )
+    add_test(
+        NAME documentation_build_contract
+        COMMAND test_project_contract
+                ${CMAKE_SOURCE_DIR}/CMakeLists.txt
+                ${CMAKE_SOURCE_DIR}/README.md
+    )
+
     add_executable(test_demo_runtime tests/test_demo_runtime.cpp)
     target_include_directories(
         test_demo_runtime PRIVATE ${CMAKE_SOURCE_DIR}/tests
@@ -133,7 +202,29 @@ if(BUILD_TESTING)
         NAME demo_runtime
         COMMAND test_demo_runtime $<TARGET_FILE:demo>
     )
-    set_tests_properties(demo_runtime PROPERTIES TIMEOUT 20)
+    set_tests_properties(
+        demo_runtime PROPERTIES TIMEOUT 20 LABELS "runtime"
+    )
+    if(ENABLE_TSAN)
+        set_tests_properties(
+            demo_runtime PROPERTIES
+            DISABLED TRUE
+            LABELS "runtime;tsan_external_glib"
+        )
+        message(STATUS
+            "TSan: demo_runtime disabled (uninstrumented GLib/GStreamer)")
+    endif()
+
+    add_executable(test_cli_runtime tests/test_cli_runtime.cpp)
+    target_include_directories(
+        test_cli_runtime PRIVATE ${CMAKE_SOURCE_DIR}/tests
+    )
+    add_dependencies(test_cli_runtime sender demo)
+    add_test(
+        NAME cli_runtime
+        COMMAND test_cli_runtime $<TARGET_FILE:sender> $<TARGET_FILE:demo>
+    )
+    set_tests_properties(cli_runtime PROPERTIES TIMEOUT 30 LABELS "runtime")
 endif()
 
 add_executable(sender src/sender.cpp)
@@ -155,6 +246,8 @@ message(STATUS "")
 message(STATUS "=== Build Configuration ===")
 message(STATUS "  C++ standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "  GStreamer:     ${GST_VERSION}")
-message(STATUS "  Version:       4.0.0 (razor GCC + loss-based adaptation)")
+message(STATUS "  ASan + UBSan:  ${ENABLE_SANITIZERS}")
+message(STATUS "  TSan:          ${ENABLE_TSAN}")
+message(STATUS "  Version:       4.0.0 (razor GCC + pacing)")
 message(STATUS "===========================")
 message(STATUS "")

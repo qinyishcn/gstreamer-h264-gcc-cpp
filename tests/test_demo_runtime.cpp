@@ -133,6 +133,16 @@ uint64_t Require(const std::map<std::string, uint64_t>& fields,
     return found->second;
 }
 
+size_t Count(const std::string& text, const std::string& needle) {
+    size_t count = 0U;
+    size_t position = 0U;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -172,7 +182,11 @@ int main(int argc, char* argv[]) {
 
     const std::string command =
         ShellQuote(argv[1]) + " --duration 5 --bitrate 1000 --port " +
-        std::to_string(port) + " >" + ShellQuote(output) + " 2>&1";
+        std::to_string(port) +
+        " --probe-first-scale 2.25 --probe-next-scale 1.75"
+        " --probe-duration-ms 120 --probe-success-ratio 0.80"
+        " --probe-retry-ms 2500 --probe-max-kbps 7000 >" +
+        ShellQuote(output) + " 2>&1";
     const int status = std::system(command.c_str());
 
     std::ifstream input(output, std::ios::binary);
@@ -182,6 +196,15 @@ int main(int argc, char* argv[]) {
         std::istreambuf_iterator<char>()};
     if (ExitCode(status) != 0) std::fprintf(stderr, "%s", log.c_str());
     CHECK_TRUE(ExitCode(status) == 0);
+    CHECK_TRUE(log.find(
+        "probe_config first_scale=2.250 next_scale=1.750 "
+        "duration_ms=120 success_ratio=0.800 retry_ms=2500 "
+        "max_kbps=7000") != std::string::npos);
+    CHECK_TRUE(log.find(
+        "gcc_transition event=probe_state from=idle to=probing "
+        "probe_kbps=2250") != std::string::npos);
+    CHECK_TRUE(Count(
+        log, "gcc_transition event=rate reason=normal") <= 6U);
 
     const std::string marker = "demo_stats ";
     const size_t stats_start = log.rfind(marker);

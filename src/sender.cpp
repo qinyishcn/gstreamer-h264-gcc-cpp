@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -24,7 +25,9 @@
 
 #include "feedback_channel.h"
 #include "feedback_packet.h"
+#include "probe_budget.h"
 #include "probe_controller.h"
+#include "rate_diagnostics.h"
 #include "rate_policy.h"
 #include "razor_wrapper.h"
 #include "rtp_packet.h"
@@ -82,6 +85,19 @@ int ParseBoundedInt(const char* text, int minimum, int maximum,
     return static_cast<int>(value);
 }
 
+double ParseBoundedDouble(const char* text, double minimum,
+                          double maximum, double fallback,
+                          bool minimum_exclusive = false) {
+    if (text == nullptr || *text == '\0') return fallback;
+    char* end = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text || *end != '\0' || !std::isfinite(value) ||
+        (minimum_exclusive ? value <= minimum : value < minimum)) {
+        return fallback;
+    }
+    return std::min(value, maximum);
+}
+
 struct SenderConfig {
     std::string host = "127.0.0.1";
     int rtp_port = 5004;
@@ -89,34 +105,98 @@ struct SenderConfig {
     int duration = 20;
     std::string preset = "ultrafast";
     int threads = 2;
+    gcc::ProbeConfig probe;
 };
 
-void ParseArgs(int argc, char* argv[], SenderConfig& config) {
+enum class ParseResult { Run, Help, Error };
+
+void PrintUsage(const char* executable) {
+    std::printf(
+        "Usage: %s [options]\n"
+        "  --host HOST                 destination (default 127.0.0.1)\n"
+        "  --port PORT                 RTP port (1..65534)\n"
+        "  --bitrate KBPS              initial bitrate (200..8000)\n"
+        "  --duration SECONDS          run time (1..86400)\n"
+        "  --preset NAME               x264 preset\n"
+        "  --threads COUNT             x264 threads (1..64)\n"
+        "  --probe-first-scale VALUE   finite value >1 (default 2.0)\n"
+        "  --probe-next-scale VALUE    finite value >1 (default 1.5)\n"
+        "  --probe-duration-ms MS      1..299 (default 100)\n"
+        "  --probe-success-ratio VALUE (0,1] (default 0.75)\n"
+        "  --probe-retry-ms MS         0..600000 (default 5000)\n"
+        "  --probe-max-kbps KBPS       0..8000; 0 disables probing\n"
+        "  --help                      show this help\n",
+        executable);
+}
+
+bool RequiresValue(const char* option) {
+    const char* options[] = {
+        "--host", "--port", "--bitrate", "--duration", "--preset",
+        "--threads", "--probe-first-scale", "--probe-next-scale",
+        "--probe-duration-ms", "--probe-success-ratio",
+        "--probe-retry-ms", "--probe-max-kbps"};
+    for (const char* candidate : options) {
+        if (std::strcmp(option, candidate) == 0) return true;
+    }
+    return false;
+}
+
+ParseResult ParseArgs(int argc, char* argv[], SenderConfig& config) {
     for (int index = 1; index < argc; ++index) {
-        if (std::strcmp(argv[index], "--host") == 0 && index + 1 < argc) {
+        const char* option = argv[index];
+        if (std::strcmp(option, "--help") == 0) return ParseResult::Help;
+        if (RequiresValue(option) &&
+            (index + 1 >= argc ||
+             std::strncmp(argv[index + 1], "--", 2U) == 0)) {
+            std::fprintf(stderr, "ERROR: missing value for %s\n", option);
+            return ParseResult::Error;
+        }
+        if (std::strcmp(option, "--host") == 0) {
             config.host = argv[++index];
-        } else if (std::strcmp(argv[index], "--port") == 0 &&
-                   index + 1 < argc) {
+        } else if (std::strcmp(option, "--port") == 0) {
             config.rtp_port =
                 ParseBoundedInt(argv[++index], 1, 65534, config.rtp_port);
-        } else if (std::strcmp(argv[index], "--bitrate") == 0 &&
-                   index + 1 < argc) {
+        } else if (std::strcmp(option, "--bitrate") == 0) {
             config.bitrate = ParseBoundedInt(
                 argv[++index], static_cast<int>(kMinBitrateKbps),
                 static_cast<int>(kMaxBitrateKbps), config.bitrate);
-        } else if (std::strcmp(argv[index], "--duration") == 0 &&
-                   index + 1 < argc) {
+        } else if (std::strcmp(option, "--duration") == 0) {
             config.duration =
                 ParseBoundedInt(argv[++index], 1, 86400, config.duration);
-        } else if (std::strcmp(argv[index], "--preset") == 0 &&
-                   index + 1 < argc) {
+        } else if (std::strcmp(option, "--preset") == 0) {
             config.preset = argv[++index];
-        } else if (std::strcmp(argv[index], "--threads") == 0 &&
-                   index + 1 < argc) {
+        } else if (std::strcmp(option, "--threads") == 0) {
             config.threads =
                 ParseBoundedInt(argv[++index], 1, 64, config.threads);
+        } else if (std::strcmp(option, "--probe-first-scale") == 0) {
+            config.probe.first_scale = ParseBoundedDouble(
+                argv[++index], 1.0, 100.0, config.probe.first_scale, true);
+        } else if (std::strcmp(option, "--probe-next-scale") == 0) {
+            config.probe.next_scale = ParseBoundedDouble(
+                argv[++index], 1.0, 100.0, config.probe.next_scale, true);
+        } else if (std::strcmp(option, "--probe-duration-ms") == 0) {
+            config.probe.duration_ms = static_cast<uint32_t>(
+                ParseBoundedInt(argv[++index], 1, 299,
+                                static_cast<int>(config.probe.duration_ms)));
+        } else if (std::strcmp(option, "--probe-success-ratio") == 0) {
+            config.probe.success_ratio = ParseBoundedDouble(
+                argv[++index], 0.0, 1.0, config.probe.success_ratio, true);
+        } else if (std::strcmp(option, "--probe-retry-ms") == 0) {
+            config.probe.retry_interval_ms = static_cast<uint32_t>(
+                ParseBoundedInt(
+                    argv[++index], 0, 600000,
+                    static_cast<int>(config.probe.retry_interval_ms)));
+        } else if (std::strcmp(option, "--probe-max-kbps") == 0) {
+            config.probe.max_kbps = static_cast<uint32_t>(
+                ParseBoundedInt(argv[++index], 0,
+                                static_cast<int>(kMaxBitrateKbps),
+                                static_cast<int>(config.probe.max_kbps)));
+        } else {
+            std::fprintf(stderr, "ERROR: unknown option: %s\n", option);
+            return ParseResult::Error;
         }
     }
+    return ParseResult::Run;
 }
 
 struct AppSinkContext {
@@ -193,6 +273,20 @@ const char* ProbeStateName(gcc::ProbeState state) {
     return "unknown";
 }
 
+const char* RateReasonName(gcc::RateReason reason) {
+    switch (reason) {
+        case gcc::RateReason::Normal:
+            return "normal";
+        case gcc::RateReason::DelayOveruse:
+            return "delay_overuse";
+        case gcc::RateReason::Loss:
+            return "loss";
+        case gcc::RateReason::ProbeAccepted:
+            return "probe_accepted";
+    }
+    return "unknown";
+}
+
 void MergeProbeAction(gcc::ProbeAction& destination,
                       const gcc::ProbeAction& source) {
     if (source.start) {
@@ -222,7 +316,12 @@ void UnrefCreatedElements(GstElement* pipeline,
 
 int main(int argc, char* argv[]) {
     SenderConfig config;
-    ParseArgs(argc, argv, config);
+    const ParseResult parse_result = ParseArgs(argc, argv, config);
+    if (parse_result == ParseResult::Help) {
+        PrintUsage(argv[0]);
+        return EXIT_SUCCESS;
+    }
+    if (parse_result == ParseResult::Error) return EXIT_FAILURE;
 
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
@@ -255,8 +354,7 @@ int main(int argc, char* argv[]) {
     uint32_t current_pacing_kbps =
         NormalPacingRate(current_network_kbps);
 
-    gcc::ProbeConfig probe_config;
-    probe_config.max_kbps = kMaxBitrateKbps;
+    const gcc::ProbeConfig probe_config = config.probe;
     gcc::ProbeController probe_controller(probe_config);
     gcc::ProbeAction deferred_probe_action;
     uint64_t probe_bytes_enqueued = 0U;
@@ -320,6 +418,12 @@ int main(int argc, char* argv[]) {
     std::printf("  Encoder rate: %u kbps\n", current_encoder_kbps);
     std::printf("  Duration:     %d seconds\n", config.duration);
     std::printf("  Feedback:     listening on port %u\n", feedback_port);
+    std::printf(
+        "probe_config first_scale=%.3f next_scale=%.3f duration_ms=%u "
+        "success_ratio=%.3f retry_ms=%u max_kbps=%u\n",
+        probe_config.first_scale, probe_config.next_scale,
+        probe_config.duration_ms, probe_config.success_ratio,
+        probe_config.retry_interval_ms, probe_config.max_kbps);
     std::printf("============================================================\n\n");
 
     GstElement* pipeline = gst_pipeline_new("sender-pipeline");
@@ -419,13 +523,43 @@ int main(int argc, char* argv[]) {
                      std::min(kbps, kMaxNormalPacingKbps));
         razor_sender.set_pacing_rate(current_pacing_kbps);
     };
+    gcc::ProbeState reported_probe_state = probe_controller.state();
+    bool has_reported_rate = false;
+    gcc::RateReason reported_rate_reason = gcc::RateReason::Normal;
+    uint64_t last_rate_transition_ms = 0U;
+    const auto report_probe_transition = [&]() {
+        const gcc::ProbeState current = probe_controller.state();
+        if (current == reported_probe_state) return;
+        std::printf(
+            "gcc_transition event=probe_state from=%s to=%s "
+            "probe_kbps=%u\n",
+            ProbeStateName(reported_probe_state), ProbeStateName(current),
+            probe_controller.active_probe_kbps());
+        std::fflush(stdout);
+        reported_probe_state = current;
+    };
     const auto apply_rate_decision =
-        [&](const gcc::RateDecision& decision) {
+        [&](const gcc::RateDecision& decision, gcc::RateReason reason) {
             if (!decision.changed) {
                 return;
             }
+            const uint32_t previous = current_network_kbps;
             current_network_kbps = decision.network_kbps;
             current_encoder_kbps = decision.encoder_kbps;
+            const uint64_t now_ms = SteadyMillis();
+            if (gcc::ShouldReportRateTransition(
+                    reason, has_reported_rate, reported_rate_reason,
+                    now_ms, last_rate_transition_ms)) {
+                std::printf(
+                    "gcc_transition event=rate reason=%s from_kbps=%u "
+                    "to_kbps=%u encoder_kbps=%u\n",
+                    RateReasonName(reason), previous, current_network_kbps,
+                    current_encoder_kbps);
+                std::fflush(stdout);
+                has_reported_rate = true;
+                reported_rate_reason = reason;
+                last_rate_transition_ms = now_ms;
+            }
             g_object_set(
                 encoder, "bitrate",
                 static_cast<guint>(current_encoder_kbps), nullptr);
@@ -471,9 +605,11 @@ int main(int argc, char* argv[]) {
                            ? gcc::RateReason::Loss
                            : gcc::RateReason::DelayOveruse)
                     : gcc::RateReason::Normal;
-            apply_rate_decision(rate_policy.Apply(
-                {reason, event.proposed_kbps, event.rtt_ms,
-                 event.now_ms}));
+            apply_rate_decision(
+                rate_policy.Apply(
+                    {reason, event.proposed_kbps, event.rtt_ms,
+                     event.now_ms}),
+                reason);
         }
         return true;
     };
@@ -483,9 +619,11 @@ int main(int argc, char* argv[]) {
                 set_pacing(NormalPacingRate(current_network_kbps));
             }
             if (action.accept) {
-                apply_rate_decision(rate_policy.Apply(
-                    {gcc::RateReason::ProbeAccepted,
-                     action.accepted_kbps, rtt_ms, SteadyMillis()}));
+                apply_rate_decision(
+                    rate_policy.Apply(
+                        {gcc::RateReason::ProbeAccepted,
+                         action.accepted_kbps, rtt_ms, SteadyMillis()}),
+                    gcc::RateReason::ProbeAccepted);
                 set_pacing(NormalPacingRate(current_network_kbps));
             }
             if (action.start) {
@@ -505,8 +643,10 @@ int main(int argc, char* argv[]) {
             deferred_probe_action = gcc::ProbeAction{};
             if (action.start || action.stop || action.accept) {
                 handle_probe_action(action);
+                report_probe_transition();
                 continue;
             }
+            report_probe_transition();
             return true;
         }
         control_queue_failed = true;
@@ -632,13 +772,10 @@ int main(int argc, char* argv[]) {
 
         if (probe_controller.state() == gcc::ProbeState::Probing &&
             transport.latest_media_header(latest_media_header)) {
-            const uint64_t elapsed_ms = std::min<uint64_t>(
-                now_ms - probe_controller.probe_start_ms(), 100U);
-            const uint64_t desired_bytes =
-                (static_cast<uint64_t>(
-                     probe_controller.active_probe_kbps()) *
-                 elapsed_ms) /
-                8U;
+            const uint64_t desired_bytes = gcc::ProbeBudgetBytes(
+                probe_controller.active_probe_kbps(),
+                probe_controller.probe_start_ms(), now_ms,
+                probe_config.duration_ms);
             while (probe_bytes_enqueued < desired_bytes) {
                 const uint64_t deficit =
                     desired_bytes - probe_bytes_enqueued;
