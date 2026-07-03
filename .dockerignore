@@ -1,0 +1,8 @@
+.git
+.worktrees
+build
+cmake-build-*
+*.o
+*.a
+*.so
+*.log
