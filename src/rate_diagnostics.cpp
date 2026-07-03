@@ -4,7 +4,7 @@ namespace gcc {
 
 bool ShouldReportRateTransition(RateReason reason,
                                 bool has_last_report,
-                                RateReason last_reason,
+                                RateReason,
                                 uint64_t now_ms,
                                 uint64_t last_report_ms) noexcept {
     if (reason != RateReason::Normal) return true;
