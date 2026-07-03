@@ -237,7 +237,8 @@ int TestWrappedOrdinalProbePrunesAtHistoryWindowBoundary() {
     gcc::TransportSender sender(
         [](const uint8_t*, size_t) { return true; },
         []() { return uint64_t{1}; },
-        64U + kMediaPackets * 12U, 0U, 0U, 0U, UINT32_MAX);
+        64U + kMediaPackets * 12U, 0U, UINT64_MAX, UINT64_MAX,
+        UINT32_MAX);
     gcc::RtpHeader source;
     const std::vector<uint8_t> media = MakePacket(12);
     CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), source));
@@ -252,6 +253,8 @@ int TestWrappedOrdinalProbePrunesAtHistoryWindowBoundary() {
              static_cast<size_t>(1));
     gcc::SentPacket probe;
     CHECK_TRUE(sender.SendPaced(probe_id, probe));
+    CHECK_EQ(probe.generation, UINT64_MAX);
+    CHECK_EQ(probe.cumulative_sent_bytes, UINT64_MAX);
     CHECK_EQ(probe.history_ordinal, UINT32_MAX);
 
     gcc::ProbeDeliveryEstimator estimator;
@@ -274,7 +277,11 @@ int TestWrappedOrdinalProbePrunesAtHistoryWindowBoundary() {
     }
     gcc::SentHistoryWatermark watermark;
     CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
+    CHECK_EQ(watermark.oldest_generation, UINT64_MAX);
+    CHECK_EQ(watermark.oldest_cumulative_sent_bytes, UINT64_MAX);
     CHECK_EQ(watermark.oldest_history_ordinal, static_cast<uint32_t>(0));
+    CHECK_EQ(watermark.newest_generation, UINT64_MAX);
+    CHECK_EQ(watermark.cumulative_sent_bytes, UINT64_MAX);
     CHECK_EQ(watermark.newest_history_ordinal,
              static_cast<uint32_t>(1999));
     estimator.AdvanceSendProgress(watermark);
