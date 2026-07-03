@@ -370,9 +370,11 @@ needs more specific behavior than the initial design:
 - A 100 ms probe cannot be validated reliably from razor's approximately
   500 ms smoothed acknowledged-rate window. `ProbeDeliveryEstimator` therefore
   validates the active probe from exact send history and receiver timestamps,
-  using the lower of its send and receive interval rates. The acknowledged
-  rate remains an input, and the accepted result is still capped by the active
-  probe rate and configured maximum.
+  using the lower of its send and receive interval rates and adjusting that
+  exact interval delivery rate by the feedback loss. Probe acceptance uses
+  this result instead of razor's 500 ms smoothed acknowledged-rate statistic;
+  the accepted result is still capped by the active probe rate and configured
+  maximum.
 - Probe traffic can also produce delayed ordinary razor bitrate callbacks.
   Exact probe history ranges guard those callbacks until feedback or bounded
   send-history progress passes the final probe packet. The range and watermark
@@ -381,11 +383,12 @@ needs more specific behavior than the initial design:
   always emit a lower target even though the outer feedback loss was already
   high. A C++ `OuterLossBackoff` is therefore an emergency fallback: rolling
   256-packet loss strictly above Q8 value 25 halves the current target through
-  `RatePolicy`, no more often than `max(250 ms, RTT)`. It is disabled for
-  probe-related feedback and resets after low loss. This is not the removed
-  proportional loss multiplier; it is a thresholded, rate-limited congestion
-  event whose random-loss and heavy-loss behavior is covered by the tc/netem
-  matrix.
+  `RatePolicy`, no more often than `max(250 ms, RTT)` within one sustained
+  high-loss episode. It is disabled for probe-related feedback; low loss resets
+  the episode, so a later high-loss episode may back off immediately. This is
+  not the removed proportional loss multiplier; it is a thresholded,
+  rate-limited congestion event whose random-loss and heavy-loss behavior is
+  covered by the tc/netem matrix.
 
 The explicit probe pacing rate is restored by the C++ razor wrapper after
 razor bitrate callbacks, because those callbacks internally recompute the
