@@ -574,27 +574,38 @@ int TestSenderProcessesFeedbackOnce(const char* source_path) {
 
 int TestWrapperRestoresExplicitPacingAfterBitrateCallback() {
     std::vector<uint32_t> applied_pacing_bps;
+    std::vector<char> events;
     razor::PacingRateApplier pacing_applier =
-        [&applied_pacing_bps](razor_sender_t* raw, uint32_t bitrate_bps) {
+        [&applied_pacing_bps, &events](
+            razor_sender_t* raw, uint32_t bitrate_bps) {
+            events.push_back('P');
             applied_pacing_bps.push_back(bitrate_bps);
             return razor_sender_set_pacing_rate(raw, bitrate_bps);
         };
     int bitrate_callbacks = 0;
     razor::Sender sender(
-        [&bitrate_callbacks](uint32_t, uint8_t, uint32_t) {
+        [&bitrate_callbacks, &events](uint32_t, uint8_t, uint32_t) {
             ++bitrate_callbacks;
+            events.push_back('C');
         },
         razor::PaceSendCallback(), 250, pacing_applier);
     CHECK_TRUE(sender.is_valid());
     sender.set_bitrates(200, 1000, 8000);
     sender.set_pacing_rate(4000);
     applied_pacing_bps.clear();
+    events.clear();
+    const int callbacks_before = bitrate_callbacks;
 
     sender.set_bitrates(200, 1500, 8000);
 
-    CHECK_TRUE(bitrate_callbacks >= 2);
-    CHECK_TRUE(!applied_pacing_bps.empty());
-    CHECK_EQ(applied_pacing_bps.back(), static_cast<uint32_t>(4000000));
+    CHECK_EQ(bitrate_callbacks, callbacks_before + 1);
+    CHECK_EQ(events.size(), static_cast<size_t>(3));
+    CHECK_EQ(events[0], 'C');
+    CHECK_EQ(events[1], 'P');
+    CHECK_EQ(events[2], 'P');
+    CHECK_EQ(applied_pacing_bps.size(), static_cast<size_t>(2));
+    CHECK_EQ(applied_pacing_bps[0], static_cast<uint32_t>(4000000));
+    CHECK_EQ(applied_pacing_bps[1], static_cast<uint32_t>(4000000));
     return EXIT_SUCCESS;
 }
 
