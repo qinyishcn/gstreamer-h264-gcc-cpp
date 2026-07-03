@@ -89,6 +89,8 @@ target_sources(gcc_support PRIVATE
     src/feedback_packet.cpp
     src/probe_budget.cpp
     src/probe_controller.cpp
+    src/probe_delivery_estimator.cpp
+    src/outer_loss_backoff.cpp
     src/rate_diagnostics.cpp
     src/rate_policy.cpp
     src/transport_sender.cpp
@@ -131,6 +133,16 @@ if(BUILD_TESTING)
     target_link_libraries(test_rate_policy gcc_support)
     add_test(NAME rate_policy COMMAND test_rate_policy)
 
+    add_executable(
+        test_outer_loss_backoff tests/test_outer_loss_backoff.cpp
+    )
+    target_include_directories(
+        test_outer_loss_backoff PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_outer_loss_backoff gcc_support)
+    add_test(NAME outer_loss_backoff COMMAND test_outer_loss_backoff)
+
     add_executable(test_probe_controller tests/test_probe_controller.cpp)
     target_include_directories(test_probe_controller PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -138,6 +150,21 @@ if(BUILD_TESTING)
     )
     target_link_libraries(test_probe_controller gcc_support)
     add_test(NAME probe_controller COMMAND test_probe_controller)
+
+    add_executable(
+        test_probe_delivery_estimator
+        tests/test_probe_delivery_estimator.cpp
+    )
+    target_include_directories(
+        test_probe_delivery_estimator PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_probe_delivery_estimator gcc_support)
+    add_test(
+        NAME probe_delivery_estimator
+        COMMAND test_probe_delivery_estimator
+    )
 
     add_executable(test_probe_budget tests/test_probe_budget.cpp)
     target_include_directories(test_probe_budget PRIVATE
@@ -165,6 +192,7 @@ if(BUILD_TESTING)
         NAME razor_feedback
         COMMAND test_razor_feedback
                 ${CMAKE_SOURCE_DIR}/vendor/razor/cc/sender_congestion_controller.c
+                ${CMAKE_SOURCE_DIR}/include/razor_wrapper.h
     )
 
     add_executable(

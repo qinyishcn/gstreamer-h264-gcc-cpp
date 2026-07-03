@@ -65,6 +65,8 @@ sender 与 demo 都支持：
 
 协议 v4 使用 16 字节 network-order header，后接最多 256 字节的 razor
 payload；它与旧 v3 二进制不兼容。反馈走 RTP 端口 + 1。
+`loss_q8` 使用最近 256 个扩展 transport sequence 的滚动窗口；
+非 probe 反馈持续高于 25/255 时，发送端按 RTT（至少 250ms）快速回退。
 
 | 偏移 | 字段 | 大小 | 说明 |
 |---:|---|---:|---|
@@ -94,7 +96,8 @@ network_rtt = sender_elapsed - receiver_residence
 sender 每秒以及退出前输出一行 `gcc_stats`：
 
 - `encoder_kbps`、`target_kbps`、`pacing_kbps`：编码、网络目标和 pacer 速率；
-- `acked_kbps`、`loss_q8`、`rtt_ms`、`delay_state`：razor 输入/估计状态；
+- `acked_kbps`、`probe_delivery_kbps`、`loss_q8`、`rtt_ms`、`delay_state`：
+  razor 平滑确认速率、当前 probe 的独立交付速率和拥塞状态；
 - `media_sent`、`probe_sent`：实际经 pacer 发出的包数；
 - `feedback`、`feedback_matched`：收到的反馈与匹配发送历史的反馈数；
 - `pacer_queue_ms`、`ingress_bytes`：pacer 与 appsink ingress 积压；

@@ -572,10 +572,26 @@ int TestSenderProcessesFeedbackOnce(const char* source_path) {
     return EXIT_SUCCESS;
 }
 
+int TestWrapperRestoresExplicitPacing(const char* wrapper_path) {
+    std::ifstream wrapper_file(wrapper_path);
+    CHECK_TRUE(wrapper_file.good());
+    const std::string wrapper(
+        (std::istreambuf_iterator<char>(wrapper_file)),
+        std::istreambuf_iterator<char>());
+    CHECK_TRUE(wrapper.find("has_explicit_pacing_rate_") !=
+               std::string::npos);
+    CHECK_TRUE(wrapper.find("configured_pacing_rate_kbps_") !=
+               std::string::npos);
+    CHECK_TRUE(CountOccurrences(
+                   wrapper, "RestoreExplicitPacingRate()") >=
+               static_cast<size_t>(2));
+    return EXIT_SUCCESS;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    CHECK_EQ(argc, 2);
+    CHECK_EQ(argc, 3);
     CHECK_EQ(TestDecoderRoundTripsAllFlagCombinations(), EXIT_SUCCESS);
     CHECK_EQ(TestDecoderRejectsEveryTruncatedPrefix(), EXIT_SUCCESS);
     CHECK_EQ(TestDecoderSampleLimits(), EXIT_SUCCESS);
@@ -589,5 +605,6 @@ int main(int argc, char** argv) {
     CHECK_EQ(TestStatsApiRejectsInvalidAndUnsupportedSendersSafely(),
              EXIT_SUCCESS);
     CHECK_EQ(TestSenderProcessesFeedbackOnce(argv[1]), EXIT_SUCCESS);
+    CHECK_EQ(TestWrapperRestoresExplicitPacing(argv[2]), EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

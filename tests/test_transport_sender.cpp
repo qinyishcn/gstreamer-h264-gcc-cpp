@@ -84,9 +84,17 @@ int TestPreservesPacketsAndMetadata() {
     CHECK_EQ(first.size, static_cast<size_t>(19));
     CHECK_EQ(first.send_time_us, static_cast<uint64_t>(1010));
     CHECK_TRUE(!first.probe);
+    CHECK_EQ(first.cumulative_sent_bytes, static_cast<uint64_t>(19));
+    CHECK_EQ(first.generation, static_cast<uint64_t>(0));
     CHECK_EQ(second.transport_sequence, static_cast<uint16_t>(1));
     CHECK_EQ(second.size, static_cast<size_t>(31));
     CHECK_TRUE(second.probe);
+    CHECK_EQ(second.cumulative_sent_bytes, static_cast<uint64_t>(50));
+    CHECK_EQ(second.generation, static_cast<uint64_t>(1));
+    gcc::SentPacketInfo lookup;
+    CHECK_TRUE(sender.LookupSentPacket(1, lookup));
+    CHECK_EQ(lookup.cumulative_sent_bytes, static_cast<uint64_t>(50));
+    CHECK_TRUE(lookup.probe);
     CHECK_EQ(datagrams.size(), static_cast<size_t>(2));
     CHECK_EQ(datagrams[0].size(), static_cast<size_t>(19));
     CHECK_EQ(datagrams[1].size(), static_cast<size_t>(31));
@@ -206,6 +214,8 @@ int TestSendFailuresEraseWithoutHistory() {
     CHECK_TRUE(!sender.LookupSendTime(0, time));
     CHECK_TRUE(!sender.SendPaced(ids[1], out));
     CHECK_TRUE(!sender.LookupSendTime(1, time));
+    gcc::SentPacketInfo info;
+    CHECK_TRUE(!sender.LookupSentPacket(0, info));
     CHECK_EQ(sender.pending_packets(), static_cast<size_t>(0));
     CHECK_EQ(sender.queued_bytes(), static_cast<size_t>(0));
     CHECK_EQ(sender.dropped_packets(), static_cast<uint64_t>(2));

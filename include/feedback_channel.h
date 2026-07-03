@@ -122,10 +122,22 @@ public:
     uint8_t get_loss_q8() {
         std::lock_guard<std::mutex> lock(mu_);
         if (!initialized_) return 0;
+        constexpr uint64_t kLossWindow = 256U;
+        const uint64_t window_first =
+            highest_ext_seq_ - first_ext_seq_ + 1U > kLossWindow
+                ? highest_ext_seq_ - (kLossWindow - 1U)
+                : first_ext_seq_;
         const uint64_t expected =
-            highest_ext_seq_ - first_ext_seq_ + 1;
+            highest_ext_seq_ - window_first + 1U;
+        uint64_t received = 0U;
+        for (uint64_t sequence = window_first;
+             sequence <= highest_ext_seq_; ++sequence) {
+            if (seen_[sequence % kSeenWindow] == sequence) {
+                ++received;
+            }
+        }
         double loss = 1.0 -
-            static_cast<double>(received_) / static_cast<double>(expected);
+            static_cast<double>(received) / static_cast<double>(expected);
         if (loss < 0) loss = 0;
         if (loss > 1) loss = 1;
         return static_cast<uint8_t>(loss * 255.0 + 0.5);

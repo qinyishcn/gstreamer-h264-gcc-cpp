@@ -187,7 +187,18 @@ int TestLossTrackerQ8() {
     }
     CHECK_EQ(tracker.get_loss_q8(), static_cast<uint8_t>(0));
     tracker.on_packet(1000);
-    CHECK_EQ(tracker.get_loss_q8(), static_cast<uint8_t>(1));
+    CHECK_TRUE(tracker.get_loss_q8() > static_cast<uint8_t>(250));
+
+    tracker.reset();
+    tracker.on_packet(0);
+    tracker.on_packet(1000);
+    CHECK_TRUE(tracker.get_loss_q8() > static_cast<uint8_t>(250));
+    for (uint32_t sequence = 1001; sequence <= 1256; ++sequence) {
+        tracker.on_packet(static_cast<uint16_t>(sequence));
+    }
+    CHECK_EQ(tracker.get_loss_q8(), static_cast<uint8_t>(0));
+    tracker.on_packet(1000);
+    CHECK_EQ(tracker.get_loss_q8(), static_cast<uint8_t>(0));
     return EXIT_SUCCESS;
 }
 

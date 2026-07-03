@@ -76,6 +76,7 @@ public:
                 } catch (...) {
                     // Never allow a C++ exception to cross the C callback ABI.
                 }
+                self->RestoreExplicitPacingRate();
             },
             this,
             [](void* handler, uint32_t packet_id, int retrans, size_t size,
@@ -135,12 +136,14 @@ public:
                 detail::KbpsToBps(min_kbps),
                 detail::KbpsToBps(start_kbps),
                 detail::KbpsToBps(max_kbps));
+            RestoreExplicitPacingRate();
         }
     }
 
     void set_pacing_rate(uint32_t bitrate_kbps) {
-        razor_sender_set_pacing_rate(
-            sender_, detail::KbpsToBps(bitrate_kbps));
+        configured_pacing_rate_kbps_ = bitrate_kbps;
+        has_explicit_pacing_rate_ = true;
+        RestoreExplicitPacingRate();
     }
 
     bool add_packet(uint32_t packet_id, bool retrans, size_t size) {
@@ -171,10 +174,20 @@ public:
     }
 
 private:
+    void RestoreExplicitPacingRate() {
+        if (sender_ && has_explicit_pacing_rate_) {
+            razor_sender_set_pacing_rate(
+                sender_,
+                detail::KbpsToBps(configured_pacing_rate_kbps_));
+        }
+    }
+
     razor_sender_t* sender_ = nullptr;
     std::function<void(uint32_t kbps, uint8_t loss, uint32_t rtt)> bitrate_cb_;
     PaceSendCallback pace_cb_;
     bool in_pace_callback_ = false;
+    bool has_explicit_pacing_rate_ = false;
+    uint32_t configured_pacing_rate_kbps_ = 0U;
 };
 
 // ── Receiver Wrapper ────────────────────────────────────────────────

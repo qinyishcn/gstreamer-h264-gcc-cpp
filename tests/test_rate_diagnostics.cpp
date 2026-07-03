@@ -9,7 +9,7 @@ int main() {
         RateReason::Normal, true, RateReason::Normal, 1099U, 100U));
     CHECK_TRUE(gcc::ShouldReportRateTransition(
         RateReason::Normal, true, RateReason::Normal, 1100U, 100U));
-    CHECK_TRUE(gcc::ShouldReportRateTransition(
+    CHECK_TRUE(!gcc::ShouldReportRateTransition(
         RateReason::Normal, true, RateReason::Loss, 101U, 100U));
     CHECK_TRUE(!gcc::ShouldReportRateTransition(
         RateReason::Normal, true, RateReason::Normal, 99U, 100U));

@@ -37,6 +37,8 @@ ProbeController::ProbeController(const ProbeConfig& config)
       probe_start_ms_(0U),
       probe_bytes_sent_(0U),
       failure_time_ms_(0U),
+      last_probe_kbps_(0U),
+      accepted_time_ms_(0U),
       last_event_time_ms_(0U) {
     config_.first_scale =
         NormalizeScale(config_.first_scale, kDefaultFirstScale);
@@ -67,9 +69,16 @@ ProbeAction ProbeController::OnStableTarget(uint32_t target_kbps,
     if (probe_kbps <= target_kbps) {
         return ProbeAction{};
     }
+    if (state_ == ProbeState::Accepted &&
+        probe_kbps <= last_probe_kbps_ &&
+        !HasElapsed(event_time, accepted_time_ms_,
+                    static_cast<uint64_t>(config_.retry_interval_ms))) {
+        return ProbeAction{};
+    }
 
     state_ = ProbeState::Probing;
     active_probe_kbps_ = probe_kbps;
+    last_probe_kbps_ = probe_kbps;
     probe_start_ms_ = event_time;
     probe_bytes_sent_ = 0U;
 
@@ -122,15 +131,15 @@ ProbeAction ProbeController::OnFeedback(const ProbeFeedback& feedback) {
     if (feedback.acked_kbps >= SuccessThreshold()) {
         action.accept = true;
         action.accepted_kbps =
-            std::min(feedback.acked_kbps, config_.max_kbps);
+            std::min(
+                std::min(feedback.acked_kbps, active_probe_kbps_),
+                config_.max_kbps);
+        accepted_time_ms_ = event_time;
         state_ = ProbeState::Accepted;
         active_probe_kbps_ = 0U;
         return action;
     }
 
-    if (state_ == ProbeState::WaitingForResult) {
-        return Fail(event_time, action.stop);
-    }
     return action;
 }
 

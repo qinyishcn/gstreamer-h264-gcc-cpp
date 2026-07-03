@@ -1,0 +1,33 @@
+#include "outer_loss_backoff.h"
+#include "test_support.h"
+
+#include <cstdint>
+
+int main() {
+    gcc::OuterLossBackoff backoff(200U);
+    gcc::OuterLossDecision decision =
+        backoff.Evaluate(26U, 4001U, 100U, 1000U, true);
+    CHECK_TRUE(decision.changed);
+    CHECK_EQ(decision.proposed_kbps, static_cast<uint32_t>(2001));
+
+    CHECK_TRUE(!backoff.Evaluate(
+        26U, 2001U, 100U, 1249U, true).changed);
+    decision = backoff.Evaluate(26U, 2001U, 100U, 1250U, true);
+    CHECK_TRUE(decision.changed);
+    CHECK_EQ(decision.proposed_kbps, static_cast<uint32_t>(1001));
+
+    CHECK_TRUE(!backoff.Evaluate(
+        26U, 1001U, 500U, 1500U, false).changed);
+    CHECK_TRUE(!backoff.Evaluate(
+        26U, 1001U, 500U, 1500U, true).changed);
+    decision = backoff.Evaluate(26U, 1001U, 500U, 1750U, true);
+    CHECK_TRUE(decision.changed);
+
+    CHECK_TRUE(!backoff.Evaluate(
+        25U, 500U, 0U, 1800U, true).changed);
+    CHECK_TRUE(backoff.Evaluate(
+        26U, 500U, 0U, 1801U, true).changed);
+    CHECK_TRUE(!backoff.Evaluate(
+        26U, 250U, 0U, 1700U, true).changed);
+    return EXIT_SUCCESS;
+}

@@ -63,6 +63,8 @@ private:
     uint64_t probe_start_ms_;
     uint64_t probe_bytes_sent_;
     uint64_t failure_time_ms_;
+    uint32_t last_probe_kbps_;
+    uint64_t accepted_time_ms_;
     uint64_t last_event_time_ms_;
 };
 

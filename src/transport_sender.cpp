@@ -1,9 +1,11 @@
 #include "transport_sender.h"
 
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <deque>
 #include <mutex>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 
@@ -57,12 +59,6 @@ struct TransportSender::Impl {
 
     struct HistoryEntry {
         uint16_t sequence;
-        uint64_t send_time_us;
-        uint64_t generation;
-    };
-
-    struct SendTimeRecord {
-        uint64_t send_time_us;
         uint64_t generation;
     };
 
@@ -109,11 +105,12 @@ struct TransportSender::Impl {
 
     uint32_t next_packet_id;
     uint64_t next_send_generation = 0;
+    uint64_t cumulative_sent_bytes = 0;
     std::unordered_map<uint32_t, Packet> paced;
     bool has_latest_media_header = false;
     RtpHeader latest_media;
     std::deque<HistoryEntry> history;
-    std::unordered_map<uint16_t, SendTimeRecord> send_times;
+    std::unordered_map<uint16_t, SentPacketInfo> send_times;
 };
 
 TransportSender::TransportSender(
@@ -236,8 +233,16 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
 
     const uint16_t sequence = static_cast<uint16_t>(packet_id);
     const uint64_t generation = impl_->next_send_generation++;
-    impl_->history.push_back({sequence, send_time_us, generation});
-    impl_->send_times[sequence] = {send_time_us, generation};
+    const uint64_t room =
+        std::numeric_limits<uint64_t>::max() -
+        impl_->cumulative_sent_bytes;
+    impl_->cumulative_sent_bytes +=
+        std::min<uint64_t>(packet.bytes.size(), room);
+    const SentPacketInfo info{
+        sequence, packet.bytes.size(), send_time_us, packet.probe,
+        impl_->cumulative_sent_bytes, generation};
+    impl_->history.push_back({sequence, generation});
+    impl_->send_times[sequence] = info;
     if (impl_->history.size() > kSendHistoryLimit) {
         const Impl::HistoryEntry oldest = impl_->history.front();
         impl_->history.pop_front();
@@ -248,8 +253,7 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
         }
     }
 
-    out = SentPacket{
-        sequence, packet.bytes.size(), send_time_us, packet.probe};
+    out = info;
     ++impl_->sent_count;
     return true;
 }
@@ -261,6 +265,16 @@ bool TransportSender::LookupSendTime(
         return false;
     }
     out_us = found->second.send_time_us;
+    return true;
+}
+
+bool TransportSender::LookupSentPacket(
+    uint16_t sequence, SentPacketInfo& out) const {
+    const auto found = impl_->send_times.find(sequence);
+    if (found == impl_->send_times.end()) {
+        return false;
+    }
+    out = found->second;
     return true;
 }
 

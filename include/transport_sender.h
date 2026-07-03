@@ -21,7 +21,10 @@ struct SentPacket {
     size_t size;
     uint64_t send_time_us;
     bool probe;
+    uint64_t cumulative_sent_bytes = 0U;
+    uint64_t generation = 0U;
 };
+using SentPacketInfo = SentPacket;
 
 class TransportSender {
 public:
@@ -56,6 +59,7 @@ public:
     // desynchronize its packet map from the razor pacer queue.
     size_t DrainIngress(const PacerAddFunction& add);
     bool SendPaced(uint32_t packet_id, SentPacket& out);
+    bool LookupSentPacket(uint16_t sequence, SentPacketInfo& out) const;
     bool LookupSendTime(uint16_t sequence, uint64_t& out_us) const;
     bool latest_media_header(RtpHeader& out) const;
     size_t ingress_bytes() const;

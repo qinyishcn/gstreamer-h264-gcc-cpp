@@ -13,6 +13,7 @@ using gcc::ProbeController;
 using gcc::ProbeFeedback;
 using gcc::ProbeState;
 
+
 int TestPublicTypesUseGccNamespace() {
     gcc::ProbeController controller;
     CHECK_EQ(controller.state(), gcc::ProbeState::Idle);
@@ -51,7 +52,41 @@ int TestSuccessfulProbeSequence() {
     return EXIT_SUCCESS;
 }
 
-int TestLowAckFailsOnlyAfterProbePeriod() {
+int TestAcceptedRateCannotExceedRequestedProbe() {
+    ProbeController controller;
+    CHECK_EQ(controller.OnStableTarget(1000U, 0U).probe_kbps, 2000U);
+    const ProbeAction accepted =
+        controller.OnFeedback(Feedback(5000U, 0.0, false, 100U));
+    CHECK_TRUE(accepted.accept);
+    CHECK_EQ(accepted.accepted_kbps, 2000U);
+    return EXIT_SUCCESS;
+}
+
+int TestAcceptedProbeOnlyRetriesSameTierAfterInterval() {
+    ProbeController controller;
+    CHECK_EQ(controller.OnStableTarget(1000U, 0U).probe_kbps, 2000U);
+    CHECK_TRUE(
+        controller.OnFeedback(Feedback(2000U, 0.0, false, 100U)).accept);
+
+    const ProbeAction next = controller.OnStableTarget(2000U, 101U);
+    CHECK_TRUE(next.start);
+    CHECK_EQ(next.probe_kbps, 3000U);
+    CHECK_TRUE(
+        controller.OnFeedback(Feedback(3000U, 0.0, false, 201U)).accept);
+
+    ProbeConfig capped_config;
+    capped_config.max_kbps = 3000U;
+    ProbeController capped(capped_config);
+    CHECK_EQ(capped.OnStableTarget(2000U, 0U).probe_kbps, 3000U);
+    CHECK_TRUE(
+        capped.OnFeedback(Feedback(3000U, 0.0, false, 100U)).accept);
+    CHECK_TRUE(!capped.OnStableTarget(2000U, 101U).start);
+    CHECK_TRUE(!capped.OnStableTarget(2000U, 5099U).start);
+    CHECK_TRUE(capped.OnStableTarget(2000U, 5100U).start);
+    return EXIT_SUCCESS;
+}
+
+int TestLowAckWaitsAfterProbePeriod() {
     ProbeController controller;
     controller.OnStableTarget(1000U, 0U);
 
@@ -64,10 +99,31 @@ int TestLowAckFailsOnlyAfterProbePeriod() {
     CHECK_TRUE(stop.stop);
     CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
 
-    const ProbeAction failed =
+    const ProbeAction low =
         controller.OnFeedback(Feedback(1499U, 0.0, false, 101U));
+    CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
+    CHECK_TRUE(!low.accept);
+    controller.OnTimer(300U);
     CHECK_EQ(controller.state(), ProbeState::Failed);
-    CHECK_TRUE(!failed.accept);
+    return EXIT_SUCCESS;
+}
+
+int TestLowAckWaitsForResultDeadline() {
+    ProbeController controller;
+    controller.OnStableTarget(1000U, 0U);
+    CHECK_TRUE(controller.OnTimer(100U).stop);
+    CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
+
+    const ProbeAction low =
+        controller.OnFeedback(Feedback(0U, 0.0, false, 101U));
+    CHECK_TRUE(!low.accept);
+    CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
+    CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
+
+    controller.OnTimer(299U);
+    CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
+    controller.OnTimer(300U);
+    CHECK_EQ(controller.state(), ProbeState::Failed);
     return EXIT_SUCCESS;
 }
 
@@ -101,6 +157,8 @@ int TestAckIsEvaluatedOnlyAfterProbePeriod() {
             controller.OnFeedback(Feedback(1499U, 0.0, false, 100U));
         CHECK_TRUE(below_threshold.stop);
         CHECK_TRUE(!below_threshold.accept);
+        CHECK_EQ(controller.state(), ProbeState::WaitingForResult);
+        controller.OnTimer(300U);
         CHECK_EQ(controller.state(), ProbeState::Failed);
     }
     return EXIT_SUCCESS;
@@ -348,7 +406,11 @@ int TestInvalidConfigurationAndNumericLimits() {
 int main() {
     CHECK_EQ(TestPublicTypesUseGccNamespace(), EXIT_SUCCESS);
     CHECK_EQ(TestSuccessfulProbeSequence(), EXIT_SUCCESS);
-    CHECK_EQ(TestLowAckFailsOnlyAfterProbePeriod(), EXIT_SUCCESS);
+    CHECK_EQ(TestAcceptedRateCannotExceedRequestedProbe(), EXIT_SUCCESS);
+    CHECK_EQ(TestAcceptedProbeOnlyRetriesSameTierAfterInterval(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestLowAckWaitsAfterProbePeriod(), EXIT_SUCCESS);
+    CHECK_EQ(TestLowAckWaitsForResultDeadline(), EXIT_SUCCESS);
     CHECK_EQ(TestAckIsEvaluatedOnlyAfterProbePeriod(), EXIT_SUCCESS);
     CHECK_EQ(TestBadFeedbackAbortsImmediately(), EXIT_SUCCESS);
     CHECK_EQ(TestRetryBoundaryAndNoOverlap(), EXIT_SUCCESS);

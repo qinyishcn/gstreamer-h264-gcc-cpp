@@ -10,6 +10,16 @@ bool Contains(const std::string& source, const char* text) {
     return source.find(text) != std::string::npos;
 }
 
+size_t Count(const std::string& source, const char* text) {
+    size_t count = 0U;
+    size_t position = 0U;
+    while ((position = source.find(text, position)) != std::string::npos) {
+        ++count;
+        position += std::char_traits<char>::length(text);
+    }
+    return count;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -31,5 +41,6 @@ int main(int argc, char* argv[]) {
     CHECK_TRUE(Contains(source, "FeedbackPacket"));
     CHECK_TRUE(Contains(source, "MediaSequenceTranslator"));
     CHECK_TRUE(Contains(source, "demo_stats encoder_kbps="));
+    CHECK_TRUE(Count(source, "razor_tx.set_bitrates(") >= 2U);
     return 0;
 }
