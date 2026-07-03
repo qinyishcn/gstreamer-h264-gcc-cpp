@@ -8,7 +8,8 @@
 namespace {
 
 gcc::SentPacketInfo Sent(uint16_t sequence, uint64_t bytes,
-                         uint64_t send_us, bool probe = false) {
+                         uint64_t send_us, bool probe = false,
+                         uint32_t history_ordinal = 0U) {
     gcc::SentPacketInfo info;
     info.transport_sequence = sequence;
     info.size = 1000U;
@@ -16,6 +17,7 @@ gcc::SentPacketInfo Sent(uint16_t sequence, uint64_t bytes,
     info.cumulative_sent_bytes = bytes;
     info.generation = sequence;
     info.probe = probe;
+    info.history_ordinal = history_ordinal;
     return info;
 }
 
@@ -89,15 +91,27 @@ int main() {
     missing_last.generation = 101U;
     missing_feedback.OnProbePacketSent(missing_last);
     missing_feedback.Finish();
-    gcc::SentHistoryWatermark retained{
-        true, 100U, 150U, 150000U};
+    gcc::SentHistoryWatermark retained;
+    retained.valid = true;
+    retained.oldest_generation = 100U;
+    retained.oldest_cumulative_sent_bytes = 100000U;
+    retained.oldest_history_ordinal = 100U;
+    retained.newest_generation = 150U;
+    retained.cumulative_sent_bytes = 150000U;
+    retained.newest_history_ordinal = 150U;
     CHECK_TRUE(missing_feedback.BeginUnmatchedFeedback(retained));
     CHECK_TRUE(missing_feedback.rate_events_guarded());
-    gcc::SentHistoryWatermark evicted{
-        true, 102U, 2102U, 2102000U};
+    gcc::SentHistoryWatermark evicted;
+    evicted.valid = true;
+    evicted.oldest_generation = 102U;
+    evicted.oldest_cumulative_sent_bytes = 102000U;
+    evicted.oldest_history_ordinal = 102U;
+    evicted.newest_generation = 2102U;
+    evicted.cumulative_sent_bytes = 2102000U;
+    evicted.newest_history_ordinal = 2102U;
     CHECK_TRUE(missing_feedback.BeginUnmatchedFeedback(evicted));
     CHECK_TRUE(!missing_feedback.rate_events_guarded());
-    CHECK_TRUE(missing_feedback.BeginFeedback(missing_last));
+    CHECK_TRUE(!missing_feedback.BeginFeedback(missing_last));
     gcc::SentPacketInfo interleaved_normal =
         Sent(100, 100500, 100500, false);
     interleaved_normal.generation = 100U;
@@ -129,18 +143,108 @@ int main() {
     later_normal.generation = 203U;
     CHECK_TRUE(!reordered.BeginFeedback(later_normal));
 
+    gcc::ProbeDeliveryEstimator no_feedback;
+    no_feedback.Start(2000U);
+    gcc::SentPacketInfo no_feedback_probe =
+        Sent(250, 250000, 250000, true, 250U);
+    no_feedback_probe.generation = 250U;
+    no_feedback.OnProbePacketSent(no_feedback_probe);
+    no_feedback.Finish();
+    CHECK_TRUE(no_feedback.rate_events_guarded());
+    gcc::SentHistoryWatermark no_feedback_progress;
+    no_feedback_progress.valid = true;
+    no_feedback_progress.oldest_generation = 251U;
+    no_feedback_progress.oldest_cumulative_sent_bytes = 251000U;
+    no_feedback_progress.oldest_history_ordinal = 251U;
+    no_feedback_progress.newest_generation = 2250U;
+    no_feedback_progress.cumulative_sent_bytes = 2250000U;
+    no_feedback_progress.newest_history_ordinal = 2250U;
+    no_feedback.AdvanceSendProgress(no_feedback_progress);
+    CHECK_TRUE(!no_feedback.rate_events_guarded());
+
+    gcc::ProbeDeliveryEstimator consecutive_tiers;
+    consecutive_tiers.Start(2000U);
+    gcc::SentPacketInfo first_tier =
+        Sent(10, 10000, 10000, true, 10U);
+    first_tier.generation = 10U;
+    consecutive_tiers.OnProbePacketSent(first_tier);
+    consecutive_tiers.Finish();
+    consecutive_tiers.Start(3000U);
+    gcc::SentPacketInfo second_tier =
+        Sent(20, 20000, 20000, true, 20U);
+    second_tier.generation = 20U;
+    consecutive_tiers.OnProbePacketSent(second_tier);
+    CHECK_TRUE(consecutive_tiers.BeginFeedback(first_tier));
+    gcc::SentPacketInfo active_tier_media =
+        Sent(15, 15000, 15000, false, 15U);
+    active_tier_media.generation = 15U;
+    CHECK_TRUE(!consecutive_tiers.BeginFeedback(active_tier_media));
+    consecutive_tiers.Finish();
+    gcc::SentPacketInfo after_tiers =
+        Sent(21, 21000, 21000, false, 21U);
+    after_tiers.generation = 21U;
+    CHECK_TRUE(!consecutive_tiers.BeginFeedback(after_tiers));
+    CHECK_TRUE(consecutive_tiers.BeginFeedback(first_tier));
+    CHECK_TRUE(consecutive_tiers.BeginFeedback(second_tier));
+    gcc::SentPacketInfo tier_media =
+        Sent(15, 15000, 15000, false, 15U);
+    tier_media.generation = 15U;
+    CHECK_TRUE(!consecutive_tiers.BeginFeedback(tier_media));
+    CHECK_TRUE(!consecutive_tiers.BeginFeedback(after_tiers));
+
+    gcc::ProbeDeliveryEstimator bounded_ranges;
+    gcc::SentPacketInfo oldest_bounded;
+    gcc::SentPacketInfo newest_bounded;
+    for (uint32_t generation = 1U; generation <= 2001U; ++generation) {
+        bounded_ranges.Start(2000U);
+        gcc::SentPacketInfo packet = Sent(
+            static_cast<uint16_t>(generation),
+            static_cast<uint64_t>(generation) * 1000U,
+            static_cast<uint64_t>(generation) * 1000U,
+            true, generation);
+        packet.generation = generation;
+        bounded_ranges.OnProbePacketSent(packet);
+        bounded_ranges.Finish();
+        if (generation == 1U) oldest_bounded = packet;
+        newest_bounded = packet;
+    }
+    gcc::SentPacketInfo bounded_crossing =
+        Sent(2002, 2002000U, 2002000U, false, 2002U);
+    bounded_crossing.generation = 2002U;
+    CHECK_TRUE(!bounded_ranges.BeginFeedback(bounded_crossing));
+    CHECK_TRUE(!bounded_ranges.BeginFeedback(oldest_bounded));
+    CHECK_TRUE(bounded_ranges.BeginFeedback(newest_bounded));
+
     gcc::ProbeDeliveryEstimator saturated;
     saturated.Start(2000U);
     gcc::SentPacketInfo saturated_probe =
-        Sent(300, UINT64_MAX, 300000, true);
+        Sent(300, UINT64_MAX, 300000, true, 100U);
     saturated_probe.generation = 300U;
     saturated.OnProbePacketSent(saturated_probe);
     saturated.Finish();
     gcc::SentPacketInfo saturated_crossing =
-        Sent(301, UINT64_MAX, 301000, false);
+        Sent(301, UINT64_MAX, 301000, false, 101U);
     saturated_crossing.generation = 301U;
     CHECK_TRUE(!saturated.BeginFeedback(saturated_crossing));
     CHECK_TRUE(!saturated.rate_events_guarded());
+
+    gcc::ProbeDeliveryEstimator doubly_saturated;
+    doubly_saturated.Start(2000U);
+    gcc::SentPacketInfo saturated_range =
+        Sent(400, UINT64_MAX, 400000, true, UINT32_MAX);
+    saturated_range.generation = UINT64_MAX;
+    doubly_saturated.OnProbePacketSent(saturated_range);
+    doubly_saturated.Finish();
+    gcc::SentHistoryWatermark saturated_watermark;
+    saturated_watermark.valid = true;
+    saturated_watermark.oldest_generation = UINT64_MAX;
+    saturated_watermark.oldest_cumulative_sent_bytes = UINT64_MAX;
+    saturated_watermark.oldest_history_ordinal = 0U;
+    saturated_watermark.newest_generation = UINT64_MAX;
+    saturated_watermark.cumulative_sent_bytes = UINT64_MAX;
+    saturated_watermark.newest_history_ordinal = 1U;
+    doubly_saturated.AdvanceSendProgress(saturated_watermark);
+    CHECK_TRUE(!doubly_saturated.rate_events_guarded());
 
     gcc::ProbeDeliveryEstimator extreme;
     extreme.ObserveFeedback(

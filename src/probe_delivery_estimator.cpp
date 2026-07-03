@@ -6,10 +6,30 @@
 namespace gcc {
 namespace {
 
+constexpr size_t kMaximumProbeRanges = 2000U;
+
 uint32_t Saturate(uint64_t value) {
     return value > std::numeric_limits<uint32_t>::max()
                ? std::numeric_limits<uint32_t>::max()
                : static_cast<uint32_t>(value);
+}
+
+bool OrdinalAfter(uint32_t candidate, uint32_t reference) {
+    const uint32_t distance = candidate - reference;
+    return distance != 0U && distance < UINT32_C(0x80000000);
+}
+
+bool PositionAfter(
+    uint64_t candidate_generation, uint64_t candidate_bytes,
+    uint32_t candidate_ordinal, uint64_t reference_generation,
+    uint64_t reference_bytes, uint32_t reference_ordinal) {
+    if (candidate_generation != reference_generation) {
+        return candidate_generation > reference_generation;
+    }
+    if (candidate_bytes != reference_bytes) {
+        return candidate_bytes > reference_bytes;
+    }
+    return OrdinalAfter(candidate_ordinal, reference_ordinal);
 }
 
 }  // namespace
@@ -35,26 +55,39 @@ void ProbeDeliveryEstimator::OnProbePacketSent(
         first_probe_.generation = packet.generation;
         first_probe_.valid = true;
         awaiting_first_probe_ = false;
+        if (probe_ranges_.size() == kMaximumProbeRanges) {
+            probe_ranges_.pop_front();
+        }
+        probe_ranges_.push_back(
+            {packet.generation, packet.cumulative_sent_bytes,
+             packet.history_ordinal, packet.generation,
+             packet.cumulative_sent_bytes, packet.history_ordinal});
     }
     has_last_probe_packet_ = true;
     last_probe_cumulative_bytes_ = packet.cumulative_sent_bytes;
     last_probe_generation_ = packet.generation;
+    last_probe_history_ordinal_ = packet.history_ordinal;
+    ProbeRange& range = probe_ranges_.back();
+    range.last_generation = packet.generation;
+    range.last_cumulative_bytes = packet.cumulative_sent_bytes;
+    range.last_history_ordinal = packet.history_ordinal;
 }
 
 bool ProbeDeliveryEstimator::BeginFeedback(
     const SentPacketInfo& packet) {
     if (active_) {
-        return first_probe_.valid &&
-               packet.generation >= first_probe_.generation;
+        return IsProbeGeneration(packet);
     }
     if (!has_last_probe_packet_) {
         rate_guard_active_ = false;
         return false;
     }
     if (rate_guard_active_) {
-        if (packet.generation > last_probe_generation_ &&
-            packet.cumulative_sent_bytes >=
-                last_probe_cumulative_bytes_) {
+        if (PositionAfter(
+                packet.generation, packet.cumulative_sent_bytes,
+                packet.history_ordinal, last_probe_generation_,
+                last_probe_cumulative_bytes_,
+                last_probe_history_ordinal_)) {
             rate_guard_active_ = false;
         } else {
             return true;
@@ -66,21 +99,61 @@ bool ProbeDeliveryEstimator::BeginFeedback(
 bool ProbeDeliveryEstimator::BeginUnmatchedFeedback(
     const SentHistoryWatermark& watermark) {
     const bool related = active_ || rate_guard_active_;
+    AdvanceSendProgress(watermark);
+    return related;
+}
+
+void ProbeDeliveryEstimator::AdvanceSendProgress(
+    const SentHistoryWatermark& watermark) {
+    if (!watermark.valid) return;
+    const size_t current_ranges = active_ && has_last_probe_packet_ ? 1U : 0U;
+    while (probe_ranges_.size() > current_ranges) {
+        const ProbeRange& range = probe_ranges_.front();
+        if (!WatermarkPast(
+                watermark, range.last_generation,
+                range.last_cumulative_bytes,
+                range.last_history_ordinal)) {
+            break;
+        }
+        probe_ranges_.pop_front();
+    }
     if (!active_ && rate_guard_active_ && has_last_probe_packet_ &&
-        watermark.valid &&
-        watermark.oldest_generation > last_probe_generation_ &&
-        watermark.newest_generation > last_probe_generation_ &&
-        watermark.cumulative_sent_bytes >= last_probe_cumulative_bytes_) {
+        WatermarkPast(
+            watermark, last_probe_generation_,
+            last_probe_cumulative_bytes_,
+            last_probe_history_ordinal_)) {
         rate_guard_active_ = false;
     }
-    return related;
+}
+
+bool ProbeDeliveryEstimator::WatermarkPast(
+    const SentHistoryWatermark& watermark, uint64_t generation,
+    uint64_t cumulative_bytes, uint32_t history_ordinal) const {
+    return watermark.valid &&
+           PositionAfter(
+               watermark.oldest_generation,
+               watermark.oldest_cumulative_sent_bytes,
+               watermark.oldest_history_ordinal, generation,
+               cumulative_bytes, history_ordinal);
 }
 
 bool ProbeDeliveryEstimator::IsProbeGeneration(
     const SentPacketInfo& packet) const {
-    return packet.probe && first_probe_.valid && has_last_probe_packet_ &&
-           packet.generation >= first_probe_.generation &&
-           packet.generation <= last_probe_generation_;
+    if (!packet.probe) return false;
+    for (const ProbeRange& range : probe_ranges_) {
+        const bool before_range = PositionAfter(
+            range.first_generation, range.first_cumulative_bytes,
+            range.first_history_ordinal, packet.generation,
+            packet.cumulative_sent_bytes, packet.history_ordinal);
+        const bool after_range = PositionAfter(
+            packet.generation, packet.cumulative_sent_bytes,
+            packet.history_ordinal, range.last_generation,
+            range.last_cumulative_bytes, range.last_history_ordinal);
+        if (!before_range && !after_range) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ProbeDeliveryEstimator::ObserveFeedback(

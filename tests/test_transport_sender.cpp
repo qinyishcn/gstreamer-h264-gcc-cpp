@@ -1,3 +1,4 @@
+#include "probe_delivery_estimator.h"
 #include "transport_sender.h"
 #include "test_support.h"
 
@@ -110,8 +111,12 @@ int TestPreservesPacketsAndMetadata() {
     CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
     CHECK_TRUE(watermark.valid);
     CHECK_EQ(watermark.oldest_generation, static_cast<uint64_t>(0));
+    CHECK_EQ(watermark.oldest_cumulative_sent_bytes,
+             static_cast<uint64_t>(19));
+    CHECK_EQ(watermark.oldest_history_ordinal, static_cast<uint32_t>(0));
     CHECK_EQ(watermark.newest_generation, static_cast<uint64_t>(1));
     CHECK_EQ(watermark.cumulative_sent_bytes, static_cast<uint64_t>(50));
+    CHECK_EQ(watermark.newest_history_ordinal, static_cast<uint32_t>(1));
     return EXIT_SUCCESS;
 }
 
@@ -167,9 +172,100 @@ int TestHistoryWatermarkAdvancesAfterBoundedEviction() {
     gcc::SentHistoryWatermark watermark;
     CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
     CHECK_EQ(watermark.oldest_generation, static_cast<uint64_t>(1));
+    CHECK_EQ(watermark.oldest_history_ordinal, static_cast<uint32_t>(1));
     CHECK_EQ(watermark.newest_generation, static_cast<uint64_t>(2000));
+    CHECK_EQ(watermark.newest_history_ordinal,
+             static_cast<uint32_t>(2000));
     CHECK_EQ(watermark.cumulative_sent_bytes,
              static_cast<uint64_t>(kPackets * 12U));
+    return EXIT_SUCCESS;
+}
+
+int TestNoFeedbackGuardClearsFromRealSendProgress() {
+    constexpr size_t kMediaPackets = 2000U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        []() { return uint64_t{1}; },
+        64U + kMediaPackets * 12U);
+    gcc::RtpHeader source;
+    const std::vector<uint8_t> media = MakePacket(12);
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), source));
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(source, 0U, 64U)));
+    uint32_t probe_id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&probe_id](uint32_t id, size_t) {
+                     probe_id = id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    gcc::SentPacket probe;
+    CHECK_TRUE(sender.SendPaced(probe_id, probe));
+    CHECK_TRUE(probe.probe);
+
+    gcc::ProbeDeliveryEstimator estimator;
+    estimator.Start(2000U);
+    estimator.OnProbePacketSent(probe);
+    estimator.Finish();
+    CHECK_TRUE(estimator.rate_events_guarded());
+
+    for (size_t i = 0; i < kMediaPackets; ++i) {
+        CHECK_TRUE(sender.EnqueueMedia(media));
+    }
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             kMediaPackets);
+    for (uint32_t id : ids) {
+        gcc::SentPacket sent;
+        CHECK_TRUE(sender.SendPaced(id, sent));
+    }
+    gcc::SentHistoryWatermark watermark;
+    CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
+    estimator.AdvanceSendProgress(watermark);
+    const bool subsequent_heartbeat_rate_related =
+        estimator.rate_events_guarded();
+    CHECK_TRUE(!subsequent_heartbeat_rate_related);
+    return EXIT_SUCCESS;
+}
+
+int TestGenerationSaturatesWithoutWrapping() {
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        []() { return uint64_t{1}; }, 36U, 0U,
+        UINT64_MAX - 1U, UINT64_MAX - 20U, UINT32_MAX);
+    for (size_t i = 0; i < 3U; ++i) {
+        CHECK_TRUE(sender.EnqueueMedia(MakePacket(12)));
+    }
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             static_cast<size_t>(3));
+    gcc::SentPacket first;
+    gcc::SentPacket second;
+    gcc::SentPacket third;
+    CHECK_TRUE(sender.SendPaced(ids[0], first));
+    CHECK_TRUE(sender.SendPaced(ids[1], second));
+    CHECK_TRUE(sender.SendPaced(ids[2], third));
+    CHECK_EQ(first.generation, UINT64_MAX - 1U);
+    CHECK_EQ(second.generation, UINT64_MAX);
+    CHECK_EQ(third.generation, UINT64_MAX);
+    CHECK_EQ(first.history_ordinal, UINT32_MAX);
+    CHECK_EQ(second.history_ordinal, static_cast<uint32_t>(0));
+    CHECK_EQ(third.history_ordinal, static_cast<uint32_t>(1));
+    CHECK_EQ(first.cumulative_sent_bytes, UINT64_MAX - 8U);
+    CHECK_EQ(second.cumulative_sent_bytes, UINT64_MAX);
+    CHECK_EQ(third.cumulative_sent_bytes, UINT64_MAX);
+    gcc::SentHistoryWatermark watermark;
+    CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
+    CHECK_EQ(watermark.newest_generation, UINT64_MAX);
+    CHECK_EQ(watermark.newest_history_ordinal, static_cast<uint32_t>(1));
     return EXIT_SUCCESS;
 }
 
@@ -569,6 +665,9 @@ int main() {
     CHECK_EQ(TestNoPacketSamplingCap(), EXIT_SUCCESS);
     CHECK_EQ(TestHistoryWatermarkAdvancesAfterBoundedEviction(),
              EXIT_SUCCESS);
+    CHECK_EQ(TestNoFeedbackGuardClearsFromRealSendProgress(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestGenerationSaturatesWithoutWrapping(), EXIT_SUCCESS);
     CHECK_EQ(TestIngressBoundAndValidation(), EXIT_SUCCESS);
     CHECK_EQ(TestPacerFailuresErasePackets(), EXIT_SUCCESS);
     CHECK_EQ(TestSendFailuresEraseWithoutHistory(), EXIT_SUCCESS);

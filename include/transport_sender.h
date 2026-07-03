@@ -23,14 +23,18 @@ struct SentPacket {
     bool probe;
     uint64_t cumulative_sent_bytes = 0U;
     uint64_t generation = 0U;
+    uint32_t history_ordinal = 0U;
 };
 using SentPacketInfo = SentPacket;
 
 struct SentHistoryWatermark {
     bool valid = false;
     uint64_t oldest_generation = 0U;
+    uint64_t oldest_cumulative_sent_bytes = 0U;
+    uint32_t oldest_history_ordinal = 0U;
     uint64_t newest_generation = 0U;
     uint64_t cumulative_sent_bytes = 0U;
+    uint32_t newest_history_ordinal = 0U;
 };
 
 class TransportSender {
@@ -46,6 +50,11 @@ public:
     TransportSender(
         SendFunction send, ClockFunction clock, size_t max_ingress_bytes,
         uint32_t initial_packet_id);
+    TransportSender(
+        SendFunction send, ClockFunction clock, size_t max_ingress_bytes,
+        uint32_t initial_packet_id, uint64_t initial_generation,
+        uint64_t initial_cumulative_sent_bytes,
+        uint32_t initial_history_ordinal);
     ~TransportSender();
 
     TransportSender(const TransportSender&) = delete;

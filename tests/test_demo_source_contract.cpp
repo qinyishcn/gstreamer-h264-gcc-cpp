@@ -44,6 +44,9 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(Contains(
             source, "probe_acked_kbps =\n"
                     "                static_cast<uint32_t>(loss_adjusted_delivery)"));
+        CHECK_TRUE(Contains(source, "advance_probe_send_progress"));
+        CHECK_TRUE(Count(
+            source, "advance_probe_send_progress();") >= 3U);
     }
     const std::string source = Read(argv[2]);
     CHECK_TRUE(!Contains(source, "razor_tx.on_send(tx_seq, 1400)"));

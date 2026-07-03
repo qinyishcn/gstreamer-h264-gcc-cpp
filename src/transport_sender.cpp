@@ -60,14 +60,22 @@ struct TransportSender::Impl {
     struct HistoryEntry {
         uint16_t sequence;
         uint64_t generation;
+        uint64_t cumulative_sent_bytes;
+        uint32_t history_ordinal;
     };
 
     Impl(SendFunction send_function, ClockFunction clock_function,
-         size_t byte_limit, uint32_t initial_packet_id)
+         size_t byte_limit, uint32_t initial_packet_id,
+         uint64_t initial_generation,
+         uint64_t initial_cumulative_sent_bytes,
+         uint32_t initial_history_ordinal)
         : send(std::move(send_function)),
           clock(std::move(clock_function)),
           max_ingress_bytes(byte_limit),
-          next_packet_id(initial_packet_id) {
+          next_packet_id(initial_packet_id),
+          next_send_generation(initial_generation),
+          cumulative_sent_bytes(initial_cumulative_sent_bytes),
+          next_history_ordinal(initial_history_ordinal) {
         send_times.reserve(kSendHistoryLimit);
     }
 
@@ -106,6 +114,7 @@ struct TransportSender::Impl {
     uint32_t next_packet_id;
     uint64_t next_send_generation = 0;
     uint64_t cumulative_sent_bytes = 0;
+    uint32_t next_history_ordinal = 0;
     std::unordered_map<uint32_t, Packet> paced;
     bool has_latest_media_header = false;
     RtpHeader latest_media;
@@ -116,14 +125,25 @@ struct TransportSender::Impl {
 TransportSender::TransportSender(
     SendFunction send, ClockFunction clock, size_t max_ingress_bytes)
     : TransportSender(
-          std::move(send), std::move(clock), max_ingress_bytes, 0) {}
+          std::move(send), std::move(clock), max_ingress_bytes, 0,
+          0U, 0U, 0U) {}
 
 TransportSender::TransportSender(
     SendFunction send, ClockFunction clock, size_t max_ingress_bytes,
     uint32_t initial_packet_id)
     : impl_(new Impl(
           std::move(send), std::move(clock), max_ingress_bytes,
-          initial_packet_id)) {}
+          initial_packet_id, 0U, 0U, 0U)) {}
+
+TransportSender::TransportSender(
+    SendFunction send, ClockFunction clock, size_t max_ingress_bytes,
+    uint32_t initial_packet_id, uint64_t initial_generation,
+    uint64_t initial_cumulative_sent_bytes,
+    uint32_t initial_history_ordinal)
+    : impl_(new Impl(
+          std::move(send), std::move(clock), max_ingress_bytes,
+          initial_packet_id, initial_generation,
+          initial_cumulative_sent_bytes, initial_history_ordinal)) {}
 
 TransportSender::~TransportSender() = default;
 
@@ -232,7 +252,13 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
     }
 
     const uint16_t sequence = static_cast<uint16_t>(packet_id);
-    const uint64_t generation = impl_->next_send_generation++;
+    const uint64_t generation = impl_->next_send_generation;
+    if (impl_->next_send_generation <
+        std::numeric_limits<uint64_t>::max()) {
+        ++impl_->next_send_generation;
+    }
+    const uint32_t history_ordinal = impl_->next_history_ordinal;
+    ++impl_->next_history_ordinal;
     const uint64_t room =
         std::numeric_limits<uint64_t>::max() -
         impl_->cumulative_sent_bytes;
@@ -240,8 +266,10 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
         std::min<uint64_t>(packet.bytes.size(), room);
     const SentPacketInfo info{
         sequence, packet.bytes.size(), send_time_us, packet.probe,
-        impl_->cumulative_sent_bytes, generation};
-    impl_->history.push_back({sequence, generation});
+        impl_->cumulative_sent_bytes, generation, history_ordinal};
+    impl_->history.push_back(
+        {sequence, generation, impl_->cumulative_sent_bytes,
+         history_ordinal});
     impl_->send_times[sequence] = info;
     if (impl_->history.size() > kSendHistoryLimit) {
         const Impl::HistoryEntry oldest = impl_->history.front();
@@ -286,8 +314,14 @@ bool TransportSender::GetSentHistoryWatermark(
     }
     out.valid = true;
     out.oldest_generation = impl_->history.front().generation;
+    out.oldest_cumulative_sent_bytes =
+        impl_->history.front().cumulative_sent_bytes;
+    out.oldest_history_ordinal =
+        impl_->history.front().history_ordinal;
     out.newest_generation = impl_->history.back().generation;
     out.cumulative_sent_bytes = impl_->cumulative_sent_bytes;
+    out.newest_history_ordinal =
+        impl_->history.back().history_ordinal;
     return true;
 }
 

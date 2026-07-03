@@ -465,9 +465,17 @@ int main(int argc, char* argv[]) {
     uint32_t rtt_ms = 0U;
     std::array<uint64_t, 65536> consumed_send_times{};
 
+    const auto advance_probe_send_progress = [&]() {
+        gcc::SentHistoryWatermark watermark;
+        if (transport.GetSentHistoryWatermark(watermark)) {
+            probe_delivery.AdvanceSendProgress(watermark);
+        }
+    };
+
     razor::Sender razor_tx(
         [&](uint32_t proposed, uint8_t loss, uint32_t rtt) {
             try {
+                advance_probe_send_progress();
                 pending_rates.push_back(
                     {proposed, loss, rtt, SteadyMillis(),
                      scoped_probe_feedback ||
@@ -780,6 +788,7 @@ int main(int argc, char* argv[]) {
                     }
                     continue;
                 }
+                advance_probe_send_progress();
                 const RawRateEvent event = pending_rates.front();
                 pending_rates.pop_front();
                 if (event.probe_related) {
@@ -1003,6 +1012,7 @@ int main(int argc, char* argv[]) {
         const uint64_t heartbeat_us = SteadyMicros();
         if (heartbeat_us - last_heartbeat_us >= 5000U) {
             razor_rx.heartbeat();
+            advance_probe_send_progress();
             razor_tx.heartbeat();
             process_control_events();
             last_heartbeat_us = heartbeat_us;
@@ -1030,6 +1040,7 @@ int main(int argc, char* argv[]) {
     const uint64_t drain_deadline = SteadyMicros() + kDrainTimeoutUs;
     bool drained = false;
     while (!control_failed && SteadyMicros() < drain_deadline) {
+        advance_probe_send_progress();
         razor_tx.heartbeat();
         process_control_events();
         process_arrivals();
