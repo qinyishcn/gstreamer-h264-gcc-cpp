@@ -232,6 +232,57 @@ int TestNoFeedbackGuardClearsFromRealSendProgress() {
     return EXIT_SUCCESS;
 }
 
+int TestWrappedOrdinalProbePrunesAtHistoryWindowBoundary() {
+    constexpr size_t kMediaPackets = 2000U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        []() { return uint64_t{1}; },
+        64U + kMediaPackets * 12U, 0U, 0U, 0U, UINT32_MAX);
+    gcc::RtpHeader source;
+    const std::vector<uint8_t> media = MakePacket(12);
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), source));
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(source, 0U, 64U)));
+    uint32_t probe_id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&probe_id](uint32_t id, size_t) {
+                     probe_id = id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    gcc::SentPacket probe;
+    CHECK_TRUE(sender.SendPaced(probe_id, probe));
+    CHECK_EQ(probe.history_ordinal, UINT32_MAX);
+
+    gcc::ProbeDeliveryEstimator estimator;
+    estimator.Start(2000U);
+    estimator.OnProbePacketSent(probe);
+    estimator.Finish();
+    for (size_t i = 0; i < kMediaPackets; ++i) {
+        CHECK_TRUE(sender.EnqueueMedia(media));
+    }
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             kMediaPackets);
+    for (uint32_t id : ids) {
+        gcc::SentPacket sent;
+        CHECK_TRUE(sender.SendPaced(id, sent));
+    }
+    gcc::SentHistoryWatermark watermark;
+    CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
+    CHECK_EQ(watermark.oldest_history_ordinal, static_cast<uint32_t>(0));
+    CHECK_EQ(watermark.newest_history_ordinal,
+             static_cast<uint32_t>(1999));
+    estimator.AdvanceSendProgress(watermark);
+    CHECK_TRUE(!estimator.rate_events_guarded());
+    CHECK_TRUE(!estimator.BeginFeedback(probe));
+    return EXIT_SUCCESS;
+}
+
 int TestGenerationSaturatesWithoutWrapping() {
     gcc::TransportSender sender(
         [](const uint8_t*, size_t) { return true; },
@@ -661,6 +712,8 @@ static_assert(!std::is_move_assignable<gcc::TransportSender>::value,
 }  // namespace
 
 int main() {
+    CHECK_EQ(TestWrappedOrdinalProbePrunesAtHistoryWindowBoundary(),
+             EXIT_SUCCESS);
     CHECK_EQ(TestPreservesPacketsAndMetadata(), EXIT_SUCCESS);
     CHECK_EQ(TestNoPacketSamplingCap(), EXIT_SUCCESS);
     CHECK_EQ(TestHistoryWatermarkAdvancesAfterBoundedEviction(),

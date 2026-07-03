@@ -246,6 +246,35 @@ int main() {
     doubly_saturated.AdvanceSendProgress(saturated_watermark);
     CHECK_TRUE(!doubly_saturated.rate_events_guarded());
 
+    gcc::ProbeDeliveryEstimator wrapped_probe_range;
+    wrapped_probe_range.Start(2000U);
+    gcc::SentPacketInfo wrapped_first =
+        Sent(500, UINT64_MAX, 500000, true, UINT32_MAX - 1U);
+    wrapped_first.generation = UINT64_MAX;
+    gcc::SentPacketInfo wrapped_middle =
+        Sent(501, UINT64_MAX, 501000, true, UINT32_MAX);
+    wrapped_middle.generation = UINT64_MAX;
+    gcc::SentPacketInfo wrapped_last =
+        Sent(502, UINT64_MAX, 502000, true, 0U);
+    wrapped_last.generation = UINT64_MAX;
+    wrapped_probe_range.OnProbePacketSent(wrapped_first);
+    wrapped_probe_range.OnProbePacketSent(wrapped_middle);
+    wrapped_probe_range.OnProbePacketSent(wrapped_last);
+    wrapped_probe_range.Finish();
+
+    gcc::SentPacketInfo wrapped_after =
+        Sent(503, UINT64_MAX, 503000, true, 1U);
+    wrapped_after.generation = UINT64_MAX;
+    CHECK_TRUE(!wrapped_probe_range.BeginFeedback(wrapped_after));
+    CHECK_TRUE(!wrapped_probe_range.rate_events_guarded());
+    CHECK_TRUE(wrapped_probe_range.BeginFeedback(wrapped_first));
+    CHECK_TRUE(wrapped_probe_range.BeginFeedback(wrapped_middle));
+    CHECK_TRUE(wrapped_probe_range.BeginFeedback(wrapped_last));
+    gcc::SentPacketInfo wrapped_before =
+        Sent(499, UINT64_MAX, 499000, true, UINT32_MAX - 2U);
+    wrapped_before.generation = UINT64_MAX;
+    CHECK_TRUE(!wrapped_probe_range.BeginFeedback(wrapped_before));
+
     gcc::ProbeDeliveryEstimator extreme;
     extreme.ObserveFeedback(
         Sent(10, 1, 1), std::numeric_limits<uint32_t>::max() - 10U);
