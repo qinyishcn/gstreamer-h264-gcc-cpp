@@ -278,6 +278,19 @@ bool TransportSender::LookupSentPacket(
     return true;
 }
 
+bool TransportSender::GetSentHistoryWatermark(
+    SentHistoryWatermark& out) const {
+    out = SentHistoryWatermark{};
+    if (impl_->history.empty()) {
+        return false;
+    }
+    out.valid = true;
+    out.oldest_generation = impl_->history.front().generation;
+    out.newest_generation = impl_->history.back().generation;
+    out.cumulative_sent_bytes = impl_->cumulative_sent_bytes;
+    return true;
+}
+
 bool TransportSender::latest_media_header(RtpHeader& out) const {
     if (!impl_->has_latest_media_header) {
         return false;

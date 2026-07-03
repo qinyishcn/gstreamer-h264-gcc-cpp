@@ -43,7 +43,6 @@ void ProbeDeliveryEstimator::OnProbePacketSent(
 
 bool ProbeDeliveryEstimator::BeginFeedback(
     const SentPacketInfo& packet) {
-    if (!rate_guard_active_) return false;
     if (active_) {
         return first_probe_.valid &&
                packet.generation >= first_probe_.generation;
@@ -52,12 +51,36 @@ bool ProbeDeliveryEstimator::BeginFeedback(
         rate_guard_active_ = false;
         return false;
     }
-    if (packet.generation <= last_probe_generation_ ||
-        packet.cumulative_sent_bytes <= last_probe_cumulative_bytes_) {
-        return true;
+    if (rate_guard_active_) {
+        if (packet.generation > last_probe_generation_ &&
+            packet.cumulative_sent_bytes >=
+                last_probe_cumulative_bytes_) {
+            rate_guard_active_ = false;
+        } else {
+            return true;
+        }
     }
-    rate_guard_active_ = false;
-    return true;
+    return IsProbeGeneration(packet);
+}
+
+bool ProbeDeliveryEstimator::BeginUnmatchedFeedback(
+    const SentHistoryWatermark& watermark) {
+    const bool related = active_ || rate_guard_active_;
+    if (!active_ && rate_guard_active_ && has_last_probe_packet_ &&
+        watermark.valid &&
+        watermark.oldest_generation > last_probe_generation_ &&
+        watermark.newest_generation > last_probe_generation_ &&
+        watermark.cumulative_sent_bytes >= last_probe_cumulative_bytes_) {
+        rate_guard_active_ = false;
+    }
+    return related;
+}
+
+bool ProbeDeliveryEstimator::IsProbeGeneration(
+    const SentPacketInfo& packet) const {
+    return packet.probe && first_probe_.valid && has_last_probe_packet_ &&
+           packet.generation >= first_probe_.generation &&
+           packet.generation <= last_probe_generation_;
 }
 
 void ProbeDeliveryEstimator::ObserveFeedback(
@@ -116,7 +139,6 @@ void ProbeDeliveryEstimator::ObserveFeedback(
 void ProbeDeliveryEstimator::Finish() {
     active_ = false;
     awaiting_first_probe_ = false;
-    first_probe_ = Point{};
     receiver_baseline_ = Point{};
     if (!has_last_probe_packet_) {
         rate_guard_active_ = false;

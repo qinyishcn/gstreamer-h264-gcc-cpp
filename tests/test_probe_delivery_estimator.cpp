@@ -44,7 +44,7 @@ int main() {
     estimator.Finish();
     CHECK_TRUE(estimator.rate_events_guarded());
     CHECK_TRUE(estimator.BeginFeedback(Sent(2, 2000, 110000, true)));
-    CHECK_TRUE(estimator.BeginFeedback(Sent(4, 10000, 130000)));
+    CHECK_TRUE(!estimator.BeginFeedback(Sent(4, 10000, 130000)));
     CHECK_TRUE(!estimator.rate_events_guarded());
 
     estimator.ObserveFeedback(
@@ -77,6 +77,70 @@ int main() {
         Sent(22, 108000, 140000), 1040U);
     CHECK_EQ(skipped_boundary_feedback.estimate_kbps(),
              static_cast<uint32_t>(1600));
+
+    gcc::ProbeDeliveryEstimator missing_feedback;
+    missing_feedback.Start(2000U);
+    gcc::SentPacketInfo missing_first =
+        Sent(100, 100000, 100000, true);
+    missing_first.generation = 100U;
+    missing_feedback.OnProbePacketSent(missing_first);
+    gcc::SentPacketInfo missing_last =
+        Sent(101, 101000, 101000, true);
+    missing_last.generation = 101U;
+    missing_feedback.OnProbePacketSent(missing_last);
+    missing_feedback.Finish();
+    gcc::SentHistoryWatermark retained{
+        true, 100U, 150U, 150000U};
+    CHECK_TRUE(missing_feedback.BeginUnmatchedFeedback(retained));
+    CHECK_TRUE(missing_feedback.rate_events_guarded());
+    gcc::SentHistoryWatermark evicted{
+        true, 102U, 2102U, 2102000U};
+    CHECK_TRUE(missing_feedback.BeginUnmatchedFeedback(evicted));
+    CHECK_TRUE(!missing_feedback.rate_events_guarded());
+    CHECK_TRUE(missing_feedback.BeginFeedback(missing_last));
+    gcc::SentPacketInfo interleaved_normal =
+        Sent(100, 100500, 100500, false);
+    interleaved_normal.generation = 100U;
+    CHECK_TRUE(!missing_feedback.BeginFeedback(interleaved_normal));
+    gcc::SentPacketInfo definitely_new =
+        Sent(102, 102000, 102000, false);
+    definitely_new.generation = 102U;
+    CHECK_TRUE(!missing_feedback.BeginFeedback(definitely_new));
+
+    gcc::ProbeDeliveryEstimator reordered;
+    reordered.Start(2000U);
+    gcc::SentPacketInfo reordered_first =
+        Sent(200, 200000, 200000, true);
+    reordered_first.generation = 200U;
+    reordered.OnProbePacketSent(reordered_first);
+    gcc::SentPacketInfo reordered_last =
+        Sent(201, 201000, 201000, true);
+    reordered_last.generation = 201U;
+    reordered.OnProbePacketSent(reordered_last);
+    reordered.Finish();
+    gcc::SentPacketInfo post_probe =
+        Sent(202, 202000, 202000, false);
+    post_probe.generation = 202U;
+    CHECK_TRUE(!reordered.BeginFeedback(post_probe));
+    CHECK_TRUE(!reordered.rate_events_guarded());
+    CHECK_TRUE(reordered.BeginFeedback(reordered_last));
+    gcc::SentPacketInfo later_normal =
+        Sent(203, 203000, 203000, false);
+    later_normal.generation = 203U;
+    CHECK_TRUE(!reordered.BeginFeedback(later_normal));
+
+    gcc::ProbeDeliveryEstimator saturated;
+    saturated.Start(2000U);
+    gcc::SentPacketInfo saturated_probe =
+        Sent(300, UINT64_MAX, 300000, true);
+    saturated_probe.generation = 300U;
+    saturated.OnProbePacketSent(saturated_probe);
+    saturated.Finish();
+    gcc::SentPacketInfo saturated_crossing =
+        Sent(301, UINT64_MAX, 301000, false);
+    saturated_crossing.generation = 301U;
+    CHECK_TRUE(!saturated.BeginFeedback(saturated_crossing));
+    CHECK_TRUE(!saturated.rate_events_guarded());
 
     gcc::ProbeDeliveryEstimator extreme;
     extreme.ObserveFeedback(

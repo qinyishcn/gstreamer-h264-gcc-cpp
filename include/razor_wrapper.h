@@ -70,8 +70,10 @@ public:
             0,  // gcc_congestion
             0,  // no padding
             this,
-            [](void* trigger, uint32_t bitrate_bps, uint8_t loss, uint32_t rtt) {
+            [](void* trigger, uint32_t bitrate_bps, uint8_t loss,
+               uint32_t rtt) noexcept {
                 auto* self = static_cast<Sender*>(trigger);
+                if (!self) return;
                 // Convert bps -> kbps for the callback
                 try {
                     if (self->bitrate_cb_)
@@ -80,7 +82,11 @@ public:
                 } catch (...) {
                     // Never allow a C++ exception to cross the C callback ABI.
                 }
-                self->RestoreExplicitPacingRate();
+                try {
+                    self->RestoreExplicitPacingRate();
+                } catch (...) {
+                    // The injected applier follows the same C ABI boundary.
+                }
             },
             this,
             [](void* handler, uint32_t packet_id, int retrans, size_t size,

@@ -106,6 +106,12 @@ int TestPreservesPacketsAndMetadata() {
     CHECK_EQ(datagrams[1][30], probe[30]);
     CHECK_EQ(sender.queued_bytes(), static_cast<size_t>(0));
     CHECK_EQ(sender.sent_packets(), static_cast<uint64_t>(2));
+    gcc::SentHistoryWatermark watermark;
+    CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
+    CHECK_TRUE(watermark.valid);
+    CHECK_EQ(watermark.oldest_generation, static_cast<uint64_t>(0));
+    CHECK_EQ(watermark.newest_generation, static_cast<uint64_t>(1));
+    CHECK_EQ(watermark.cumulative_sent_bytes, static_cast<uint64_t>(50));
     return EXIT_SUCCESS;
 }
 
@@ -136,6 +142,34 @@ int TestNoPacketSamplingCap() {
         CHECK_EQ(packet.size, static_cast<size_t>(20));
     }
     CHECK_EQ(sent, static_cast<size_t>(150));
+    return EXIT_SUCCESS;
+}
+
+int TestHistoryWatermarkAdvancesAfterBoundedEviction() {
+    constexpr size_t kPackets = 2001U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        []() { return uint64_t{1}; }, kPackets * 12U);
+    for (size_t i = 0; i < kPackets; ++i) {
+        CHECK_TRUE(sender.EnqueueMedia(MakePacket(12)));
+    }
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             kPackets);
+    for (uint32_t id : ids) {
+        gcc::SentPacket packet;
+        CHECK_TRUE(sender.SendPaced(id, packet));
+    }
+    gcc::SentHistoryWatermark watermark;
+    CHECK_TRUE(sender.GetSentHistoryWatermark(watermark));
+    CHECK_EQ(watermark.oldest_generation, static_cast<uint64_t>(1));
+    CHECK_EQ(watermark.newest_generation, static_cast<uint64_t>(2000));
+    CHECK_EQ(watermark.cumulative_sent_bytes,
+             static_cast<uint64_t>(kPackets * 12U));
     return EXIT_SUCCESS;
 }
 
@@ -533,6 +567,8 @@ static_assert(!std::is_move_assignable<gcc::TransportSender>::value,
 int main() {
     CHECK_EQ(TestPreservesPacketsAndMetadata(), EXIT_SUCCESS);
     CHECK_EQ(TestNoPacketSamplingCap(), EXIT_SUCCESS);
+    CHECK_EQ(TestHistoryWatermarkAdvancesAfterBoundedEviction(),
+             EXIT_SUCCESS);
     CHECK_EQ(TestIngressBoundAndValidation(), EXIT_SUCCESS);
     CHECK_EQ(TestPacerFailuresErasePackets(), EXIT_SUCCESS);
     CHECK_EQ(TestSendFailuresEraseWithoutHistory(), EXIT_SUCCESS);

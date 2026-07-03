@@ -609,6 +609,45 @@ int TestWrapperRestoresExplicitPacingAfterBitrateCallback() {
     return EXIT_SUCCESS;
 }
 
+int TestThrowingPacingApplierCannotEscapeBitrateCallback() {
+    int apply_calls = 0;
+    bool throw_on_next_apply = false;
+    razor::PacingRateApplier pacing_applier =
+        [&apply_calls, &throw_on_next_apply](
+            razor_sender_t* raw, uint32_t bitrate_bps) {
+            ++apply_calls;
+            if (throw_on_next_apply) {
+                throw_on_next_apply = false;
+                throw std::runtime_error("pacing applier failure");
+            }
+            return razor_sender_set_pacing_rate(raw, bitrate_bps);
+        };
+    int bitrate_callbacks = 0;
+    razor::Sender sender(
+        [&bitrate_callbacks](uint32_t, uint8_t, uint32_t) {
+            ++bitrate_callbacks;
+        },
+        razor::PaceSendCallback(), 250, pacing_applier);
+    CHECK_TRUE(sender.is_valid());
+    sender.set_bitrates(200, 1000, 8000);
+    sender.set_pacing_rate(4000);
+    apply_calls = 0;
+    throw_on_next_apply = true;
+    bool escaped = false;
+    try {
+        sender.set_bitrates(200, 1500, 8000);
+    } catch (...) {
+        escaped = true;
+    }
+    CHECK_TRUE(!escaped);
+    CHECK_EQ(apply_calls, 2);
+    CHECK_TRUE(bitrate_callbacks >= 2);
+    sender.set_pacing_rate(1300);
+    CHECK_TRUE(sender.add_packet(99, false, 100));
+    (void)sender.stats();
+    return EXIT_SUCCESS;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -627,6 +666,8 @@ int main(int argc, char** argv) {
              EXIT_SUCCESS);
     CHECK_EQ(TestSenderProcessesFeedbackOnce(argv[1]), EXIT_SUCCESS);
     CHECK_EQ(TestWrapperRestoresExplicitPacingAfterBitrateCallback(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestThrowingPacingApplierCannotEscapeBitrateCallback(),
              EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

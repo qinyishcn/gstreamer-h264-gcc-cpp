@@ -335,8 +335,9 @@ run_capacity_drop() {
               target <= 2200 && low_stamp == 0 )); then
             low_stamp=$stamp
         fi
-        if (( stamp >= change_ms && stamp - change_ms <= 1500 )); then
-            if (( pacer <= 250 )); then
+        if (( stamp >= change_ms && stamp - change_ms <= 1500 &&
+              target <= 2200 )); then
+            if (( low_stamp > 0 && stamp >= low_stamp && pacer <= 250 )); then
                 queue_ok=1
             fi
         fi

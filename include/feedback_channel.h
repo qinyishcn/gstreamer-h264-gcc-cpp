@@ -90,7 +90,6 @@ public:
         if (!initialized_) {
             first_ext_seq_ = seq;
             highest_ext_seq_ = seq;
-            received_ = 1;
             seen_.fill(std::numeric_limits<uint64_t>::max());
             seen_[seq % kSeenWindow] = seq;
             initialized_ = true;
@@ -115,7 +114,6 @@ public:
         uint64_t& seen_tag = seen_[ext_seq % kSeenWindow];
         if (seen_tag == ext_seq) return;
         seen_tag = ext_seq;
-        received_++;
     }
 
     // Returns the clamped loss fraction mapped to [0, 255].
@@ -151,7 +149,6 @@ public:
     void reset() {
         std::lock_guard<std::mutex> lock(mu_);
         initialized_ = false;
-        received_ = 0;
     }
 
 private:
@@ -160,7 +157,6 @@ private:
     bool initialized_ = false;
     uint64_t first_ext_seq_ = 0;
     uint64_t highest_ext_seq_ = 0;
-    uint64_t received_ = 0;
     std::array<uint64_t, kSeenWindow> seen_{};
 };
 

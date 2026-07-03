@@ -778,6 +778,10 @@ int main(int argc, char* argv[]) {
                 probe_delivery.ObserveFeedback(
                     feedback_info, packet.receive_time_ms);
             } else {
+                gcc::SentHistoryWatermark watermark;
+                transport.GetSentHistoryWatermark(watermark);
+                probe_related_batch =
+                    probe_delivery.BeginUnmatchedFeedback(watermark);
                 scoped_probe_feedback = probe_related_batch;
             }
             if (!packet.razor_payload.empty()) {

@@ -13,6 +13,7 @@ public:
     void ObserveFeedback(
         const SentPacketInfo& packet, uint32_t receiver_receive_ms);
     bool BeginFeedback(const SentPacketInfo& packet);
+    bool BeginUnmatchedFeedback(const SentHistoryWatermark& watermark);
     void Finish();
 
     uint32_t estimate_kbps() const;
@@ -20,6 +21,8 @@ public:
     bool rate_events_guarded() const;
 
 private:
+    bool IsProbeGeneration(const SentPacketInfo& packet) const;
+
     struct Point {
         uint64_t cumulative_bytes = 0U;
         uint64_t send_time_us = 0U;

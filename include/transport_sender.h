@@ -26,6 +26,13 @@ struct SentPacket {
 };
 using SentPacketInfo = SentPacket;
 
+struct SentHistoryWatermark {
+    bool valid = false;
+    uint64_t oldest_generation = 0U;
+    uint64_t newest_generation = 0U;
+    uint64_t cumulative_sent_bytes = 0U;
+};
+
 class TransportSender {
 public:
     using SendFunction = std::function<bool(const uint8_t*, size_t)>;
@@ -60,6 +67,7 @@ public:
     size_t DrainIngress(const PacerAddFunction& add);
     bool SendPaced(uint32_t packet_id, SentPacket& out);
     bool LookupSentPacket(uint16_t sequence, SentPacketInfo& out) const;
+    bool GetSentHistoryWatermark(SentHistoryWatermark& out) const;
     bool LookupSendTime(uint16_t sequence, uint64_t& out_us) const;
     bool latest_media_header(RtpHeader& out) const;
     size_t ingress_bytes() const;
