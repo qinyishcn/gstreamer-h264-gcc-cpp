@@ -37,6 +37,8 @@ constexpr int QueueMsToInt(uint32_t queue_ms) {
 }  // namespace detail
 
 using PaceSendCallback = std::function<void(uint32_t, int, size_t, bool)>;
+using PacingRateApplier =
+    std::function<int(razor_sender_t*, uint32_t bitrate_bps)>;
 
 struct SenderStats {
     uint32_t acked_bitrate_kbps = 0;
@@ -59,9 +61,11 @@ public:
     // bitrate_changed_cb: called when razor estimates a new bitrate (kbps)
     Sender(std::function<void(uint32_t kbps, uint8_t loss, uint32_t rtt)> bitrate_changed_cb,
            PaceSendCallback pace_send_cb = PaceSendCallback(),
-           uint32_t queue_ms = 250) {
+           uint32_t queue_ms = 250,
+           PacingRateApplier pacing_rate_applier = PacingRateApplier()) {
         bitrate_cb_ = bitrate_changed_cb;
         pace_cb_ = pace_send_cb;
+        pacing_rate_applier_ = pacing_rate_applier;
         sender_ = razor_sender_create(
             0,  // gcc_congestion
             0,  // no padding
@@ -176,15 +180,20 @@ public:
 private:
     void RestoreExplicitPacingRate() {
         if (sender_ && has_explicit_pacing_rate_) {
-            razor_sender_set_pacing_rate(
-                sender_,
-                detail::KbpsToBps(configured_pacing_rate_kbps_));
+            const uint32_t bitrate_bps =
+                detail::KbpsToBps(configured_pacing_rate_kbps_);
+            if (pacing_rate_applier_) {
+                pacing_rate_applier_(sender_, bitrate_bps);
+            } else {
+                razor_sender_set_pacing_rate(sender_, bitrate_bps);
+            }
         }
     }
 
     razor_sender_t* sender_ = nullptr;
     std::function<void(uint32_t kbps, uint8_t loss, uint32_t rtt)> bitrate_cb_;
     PaceSendCallback pace_cb_;
+    PacingRateApplier pacing_rate_applier_;
     bool in_pace_callback_ = false;
     bool has_explicit_pacing_rate_ = false;
     uint32_t configured_pacing_rate_kbps_ = 0U;

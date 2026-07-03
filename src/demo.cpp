@@ -947,9 +947,8 @@ int main(int argc, char* argv[]) {
             const uint64_t loss_adjusted_delivery =
                 static_cast<uint64_t>(probe_delivery.estimate_kbps()) *
                 static_cast<uint64_t>(255U - loss_q8) / 255U;
-            const uint32_t probe_acked_kbps = std::max(
-                stats.acked_bitrate_kbps,
-                static_cast<uint32_t>(loss_adjusted_delivery));
+            const uint32_t probe_acked_kbps =
+                static_cast<uint32_t>(loss_adjusted_delivery);
             MergeProbeAction(
                 deferred_probe_action,
                 probe_controller.OnFeedback(

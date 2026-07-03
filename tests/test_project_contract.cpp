@@ -48,6 +48,9 @@ int main(int argc, char* argv[]) {
     CHECK_TRUE(!Contains(readme, "→ udpsink"));
     CHECK_TRUE(!Contains(readme, "20% max step"));
     CHECK_TRUE(!Contains(readme, "RTT = now_ms - fb.rx_ts_ms"));
+    CHECK_TRUE(Contains(
+        readme,
+        "docker run --rm --cap-add=NET_ADMIN h264-gcc-test"));
 
     return 0;
 }

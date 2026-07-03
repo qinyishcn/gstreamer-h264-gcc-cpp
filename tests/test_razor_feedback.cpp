@@ -572,26 +572,36 @@ int TestSenderProcessesFeedbackOnce(const char* source_path) {
     return EXIT_SUCCESS;
 }
 
-int TestWrapperRestoresExplicitPacing(const char* wrapper_path) {
-    std::ifstream wrapper_file(wrapper_path);
-    CHECK_TRUE(wrapper_file.good());
-    const std::string wrapper(
-        (std::istreambuf_iterator<char>(wrapper_file)),
-        std::istreambuf_iterator<char>());
-    CHECK_TRUE(wrapper.find("has_explicit_pacing_rate_") !=
-               std::string::npos);
-    CHECK_TRUE(wrapper.find("configured_pacing_rate_kbps_") !=
-               std::string::npos);
-    CHECK_TRUE(CountOccurrences(
-                   wrapper, "RestoreExplicitPacingRate()") >=
-               static_cast<size_t>(2));
+int TestWrapperRestoresExplicitPacingAfterBitrateCallback() {
+    std::vector<uint32_t> applied_pacing_bps;
+    razor::PacingRateApplier pacing_applier =
+        [&applied_pacing_bps](razor_sender_t* raw, uint32_t bitrate_bps) {
+            applied_pacing_bps.push_back(bitrate_bps);
+            return razor_sender_set_pacing_rate(raw, bitrate_bps);
+        };
+    int bitrate_callbacks = 0;
+    razor::Sender sender(
+        [&bitrate_callbacks](uint32_t, uint8_t, uint32_t) {
+            ++bitrate_callbacks;
+        },
+        razor::PaceSendCallback(), 250, pacing_applier);
+    CHECK_TRUE(sender.is_valid());
+    sender.set_bitrates(200, 1000, 8000);
+    sender.set_pacing_rate(4000);
+    applied_pacing_bps.clear();
+
+    sender.set_bitrates(200, 1500, 8000);
+
+    CHECK_TRUE(bitrate_callbacks >= 2);
+    CHECK_TRUE(!applied_pacing_bps.empty());
+    CHECK_EQ(applied_pacing_bps.back(), static_cast<uint32_t>(4000000));
     return EXIT_SUCCESS;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    CHECK_EQ(argc, 3);
+    CHECK_EQ(argc, 2);
     CHECK_EQ(TestDecoderRoundTripsAllFlagCombinations(), EXIT_SUCCESS);
     CHECK_EQ(TestDecoderRejectsEveryTruncatedPrefix(), EXIT_SUCCESS);
     CHECK_EQ(TestDecoderSampleLimits(), EXIT_SUCCESS);
@@ -605,6 +615,7 @@ int main(int argc, char** argv) {
     CHECK_EQ(TestStatsApiRejectsInvalidAndUnsupportedSendersSafely(),
              EXIT_SUCCESS);
     CHECK_EQ(TestSenderProcessesFeedbackOnce(argv[1]), EXIT_SUCCESS);
-    CHECK_EQ(TestWrapperRestoresExplicitPacing(argv[2]), EXIT_SUCCESS);
+    CHECK_EQ(TestWrapperRestoresExplicitPacingAfterBitrateCallback(),
+             EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

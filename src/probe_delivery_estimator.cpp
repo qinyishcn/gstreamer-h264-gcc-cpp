@@ -19,7 +19,8 @@ void ProbeDeliveryEstimator::Start(uint32_t) {
     awaiting_first_probe_ = true;
     rate_guard_active_ = true;
     has_last_probe_packet_ = false;
-    baseline_ = Point{};
+    first_probe_ = Point{};
+    receiver_baseline_ = Point{};
     estimate_kbps_ = 0U;
 }
 
@@ -29,7 +30,10 @@ void ProbeDeliveryEstimator::OnProbePacketSent(
         return;
     }
     if (awaiting_first_probe_) {
-        baseline_ = latest_;
+        first_probe_.cumulative_bytes = packet.cumulative_sent_bytes;
+        first_probe_.send_time_us = packet.send_time_us;
+        first_probe_.generation = packet.generation;
+        first_probe_.valid = true;
         awaiting_first_probe_ = false;
     }
     has_last_probe_packet_ = true;
@@ -40,7 +44,10 @@ void ProbeDeliveryEstimator::OnProbePacketSent(
 bool ProbeDeliveryEstimator::BeginFeedback(
     const SentPacketInfo& packet) {
     if (!rate_guard_active_) return false;
-    if (active_) return true;
+    if (active_) {
+        return first_probe_.valid &&
+               packet.generation >= first_probe_.generation;
+    }
     if (!has_last_probe_packet_) {
         rate_guard_active_ = false;
         return false;
@@ -62,38 +69,45 @@ void ProbeDeliveryEstimator::ObserveFeedback(
     current.receiver_receive_ms = receiver_receive_ms;
     current.valid = true;
 
-    if (latest_.valid && current.generation <= latest_.generation) {
+    if (!active_ || awaiting_first_probe_ || !first_probe_.valid ||
+        current.generation < first_probe_.generation ||
+        current.cumulative_bytes < first_probe_.cumulative_bytes ||
+        current.send_time_us < first_probe_.send_time_us) {
         return;
     }
-    latest_ = current;
-    if (!active_ || awaiting_first_probe_ || !baseline_.valid ||
-        current.generation <= baseline_.generation ||
-        current.cumulative_bytes <= baseline_.cumulative_bytes ||
-        current.send_time_us <= baseline_.send_time_us) {
+    if (!receiver_baseline_.valid) {
+        receiver_baseline_ = current;
+        return;
+    }
+    if (current.generation <= receiver_baseline_.generation ||
+        current.cumulative_bytes <= receiver_baseline_.cumulative_bytes ||
+        current.send_time_us <= first_probe_.send_time_us) {
         return;
     }
 
     const uint64_t send_delta_us =
-        current.send_time_us - baseline_.send_time_us;
+        current.send_time_us - first_probe_.send_time_us;
     const uint32_t receive_delta_ms =
         current.receiver_receive_ms -
-        baseline_.receiver_receive_ms;
+        receiver_baseline_.receiver_receive_ms;
     if (send_delta_us < UINT64_C(20000) ||
         send_delta_us > UINT64_C(10000000) ||
         receive_delta_ms < 20U ||
         receive_delta_ms > UINT32_C(10000)) {
         return;
     }
-    const uint64_t bytes =
-        current.cumulative_bytes - baseline_.cumulative_bytes;
+    const uint64_t send_bytes =
+        current.cumulative_bytes - first_probe_.cumulative_bytes;
+    const uint64_t receive_bytes =
+        current.cumulative_bytes - receiver_baseline_.cumulative_bytes;
     const uint64_t send_kbps =
-        bytes > std::numeric_limits<uint64_t>::max() / UINT64_C(8000)
+        send_bytes > std::numeric_limits<uint64_t>::max() / UINT64_C(8000)
             ? std::numeric_limits<uint64_t>::max()
-            : bytes * UINT64_C(8000) / send_delta_us;
+            : send_bytes * UINT64_C(8000) / send_delta_us;
     const uint64_t receive_kbps =
-        bytes > std::numeric_limits<uint64_t>::max() / UINT64_C(8)
+        receive_bytes > std::numeric_limits<uint64_t>::max() / UINT64_C(8)
             ? std::numeric_limits<uint64_t>::max()
-            : bytes * UINT64_C(8) / receive_delta_ms;
+            : receive_bytes * UINT64_C(8) / receive_delta_ms;
     estimate_kbps_ = std::max(
         estimate_kbps_,
         Saturate(std::min(send_kbps, receive_kbps)));
@@ -102,7 +116,8 @@ void ProbeDeliveryEstimator::ObserveFeedback(
 void ProbeDeliveryEstimator::Finish() {
     active_ = false;
     awaiting_first_probe_ = false;
-    baseline_ = Point{};
+    first_probe_ = Point{};
+    receiver_baseline_ = Point{};
     if (!has_last_probe_packet_) {
         rate_guard_active_ = false;
     }

@@ -20,21 +20,36 @@ size_t Count(const std::string& source, const char* text) {
     return count;
 }
 
+std::string Read(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) {
+        std::fprintf(stderr, "could not read %s\n", path);
+        std::exit(EXIT_FAILURE);
+    }
+    return std::string{
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>()};
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    CHECK_TRUE(argc == 2);
-    std::ifstream input(argv[1], std::ios::binary);
-    CHECK_TRUE(input.good());
-    const std::string source{
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>()};
+    CHECK_TRUE(argc == 3);
+    for (int index = 1; index < argc; ++index) {
+        const std::string source = Read(argv[index]);
 
+        CHECK_TRUE(!Contains(source, "probe_acked_kbps = std::max"));
+        CHECK_TRUE(!Contains(
+            source, "probe_acked_kbps = stats.acked_bitrate_kbps"));
+        CHECK_TRUE(Contains(
+            source, "probe_acked_kbps =\n"
+                    "                static_cast<uint32_t>(loss_adjusted_delivery)"));
+    }
+    const std::string source = Read(argv[2]);
     CHECK_TRUE(!Contains(source, "razor_tx.on_send(tx_seq, 1400)"));
     CHECK_TRUE(!Contains(source, "ReceivedFeedback"));
     CHECK_TRUE(!Contains(source, "smoothed_loss"));
     CHECK_TRUE(!Contains(source, "\"udpsink\""));
-
     CHECK_TRUE(Contains(source, "TransportSender"));
     CHECK_TRUE(Contains(source, "RatePolicy"));
     CHECK_TRUE(Contains(source, "ProbeController"));

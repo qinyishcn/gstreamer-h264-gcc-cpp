@@ -192,7 +192,6 @@ if(BUILD_TESTING)
         NAME razor_feedback
         COMMAND test_razor_feedback
                 ${CMAKE_SOURCE_DIR}/vendor/razor/cc/sender_congestion_controller.c
-                ${CMAKE_SOURCE_DIR}/include/razor_wrapper.h
     )
 
     add_executable(
@@ -204,7 +203,15 @@ if(BUILD_TESTING)
     )
     add_test(
         NAME demo_source_contract
-        COMMAND test_demo_source_contract ${CMAKE_SOURCE_DIR}/src/demo.cpp
+        COMMAND test_demo_source_contract
+                ${CMAKE_SOURCE_DIR}/src/sender.cpp
+                ${CMAKE_SOURCE_DIR}/src/demo.cpp
+    )
+
+    add_test(
+        NAME netem_script_contract
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_netem_script_contract.sh
+                ${CMAKE_SOURCE_DIR}/docker-test.sh
     )
 
     add_executable(test_project_contract tests/test_project_contract.cpp)

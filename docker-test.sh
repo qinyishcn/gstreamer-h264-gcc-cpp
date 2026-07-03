@@ -7,6 +7,7 @@ sender_pid=
 logger_pid=
 scenario_dir=
 scenario_name=
+scenario_start_ms=0
 
 now_ms() {
     date +%s%3N
@@ -151,6 +152,7 @@ begin_scenario() {
     sample_logger "$fifo" "$scenario_dir/sender.log" \
         "$scenario_dir/samples.log" "$scenario_dir/transitions.log" &
     logger_pid=$!
+    scenario_start_ms=$(now_ms)
     timeout --signal=TERM "$((duration + 10))s" \
         /app/build/sender --host 127.0.0.1 --port "$port" \
         --bitrate "$bitrate" --duration "$duration" >"$fifo" 2>&1 &
@@ -273,14 +275,13 @@ pass_scenario() {
 }
 
 run_ramp_up() {
-    local first stamp line target final media feedback reached=0
+    local stamp line target final media feedback reached=0
     begin_scenario ramp_up 1000 8 8 0
     wait_for_samples 1 5
     finish_scenario
-    first=$(first_sample_ms)
     while IFS=$'\t' read -r stamp line; do
         target=$(field_value "$line" target_kbps)
-        if (( stamp - first <= 5000 && target >= 5000 )); then
+        if (( stamp - scenario_start_ms <= 5000 && target >= 5000 )); then
             reached=1
         fi
     done <"$scenario_dir/samples.log"
@@ -334,8 +335,10 @@ run_capacity_drop() {
               target <= 2200 && low_stamp == 0 )); then
             low_stamp=$stamp
         fi
-        if (( low_stamp > 0 && stamp >= low_stamp && pacer <= 250 )); then
-            queue_ok=1
+        if (( stamp >= change_ms && stamp - change_ms <= 1500 )); then
+            if (( pacer <= 250 )); then
+                queue_ok=1
+            fi
         fi
     done <"$scenario_dir/samples.log"
     (( low_stamp > 0 )) ||
@@ -396,7 +399,7 @@ run_heavy_loss() {
 
 echo "============================================================"
 echo "GStreamer / GCC tc-netem acceptance matrix"
-echo "All assertion windows use the first gcc_stats line as t=0."
+echo "Ramp-up timing starts when the sender process is launched."
 gst-inspect-1.0 --version
 echo "Running prebuilt unit tests..."
 (cd /app/build && ctest --output-on-failure)

@@ -28,8 +28,8 @@ private:
         bool valid = false;
     };
 
-    Point latest_;
-    Point baseline_;
+    Point first_probe_;
+    Point receiver_baseline_;
     bool active_ = false;
     bool awaiting_first_probe_ = false;
     bool rate_guard_active_ = false;

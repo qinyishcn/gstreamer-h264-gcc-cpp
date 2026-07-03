@@ -175,7 +175,7 @@ GStreamer 1.28 的实测报告中，竞争落在外部 `g_queue_pop_tail`、
 
 ```bash
 docker build -f Dockerfile.test -t h264-gcc-test .
-docker run --rm h264-gcc-test
+docker run --rm --cap-add=NET_ADMIN h264-gcc-test
 docker run --rm --cap-add NET_ADMIN h264-gcc-test bash -lc \
   'apt-get update -qq && apt-get install -qq -y iproute2 && \
    tc qdisc add dev lo root netem delay 100ms loss 10% && \
