@@ -362,6 +362,35 @@ Each step must be verified independently. Probe and tuning work must not begin
 until complete packet registration and loss feedback are demonstrated by
 tests.
 
+## 10.1 Implementation Notes (2026-07-03)
+
+Integration testing exposed three cases where the verified implementation
+needs more specific behavior than the initial design:
+
+- A 100 ms probe cannot be validated reliably from razor's approximately
+  500 ms smoothed acknowledged-rate window. `ProbeDeliveryEstimator` therefore
+  validates the active probe from exact send history and receiver timestamps,
+  using the lower of its send and receive interval rates. The acknowledged
+  rate remains an input, and the accepted result is still capped by the active
+  probe rate and configured maximum.
+- Probe traffic can also produce delayed ordinary razor bitrate callbacks.
+  Exact probe history ranges guard those callbacks until feedback or bounded
+  send-history progress passes the final probe packet. The range and watermark
+  comparisons include saturated counters and 32-bit ordinal wrap.
+- Under sustained netem loss, corrected classic razor loss processing did not
+  always emit a lower target even though the outer feedback loss was already
+  high. A C++ `OuterLossBackoff` is therefore an emergency fallback: rolling
+  256-packet loss strictly above Q8 value 25 halves the current target through
+  `RatePolicy`, no more often than `max(250 ms, RTT)`. It is disabled for
+  probe-related feedback and resets after low loss. This is not the removed
+  proportional loss multiplier; it is a thresholded, rate-limited congestion
+  event whose random-loss and heavy-loss behavior is covered by the tc/netem
+  matrix.
+
+The explicit probe pacing rate is restored by the C++ razor wrapper after
+razor bitrate callbacks, because those callbacks internally recompute the
+normal pacing estimate.
+
 ## 11. Non-Goals
 
 - replacing razor with libwebrtc;
