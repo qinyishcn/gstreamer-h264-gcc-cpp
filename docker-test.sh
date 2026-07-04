@@ -10,7 +10,7 @@ scenario_name=
 scenario_start_ms=0
 
 now_ms() {
-    date +%s%3N
+    awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime
 }
 
 stop_pid() {
@@ -226,6 +226,29 @@ field_value() {
     printf '%s\n' "$value"
 }
 
+verify_egress_ceiling() {
+    local prev_stamp= prev_line= stamp line bytes prev_bytes pacing prev_pacing
+    local elapsed observed allowed
+    while IFS=$'\t' read -r stamp line; do
+        if [[ -n "$prev_stamp" ]]; then
+            bytes=$(field_value "$line" wire_bytes)
+            prev_bytes=$(field_value "$prev_line" wire_bytes)
+            pacing=$(field_value "$line" pacing_kbps)
+            prev_pacing=$(field_value "$prev_line" pacing_kbps)
+            elapsed=$((stamp - prev_stamp))
+            if (( elapsed > 0 && bytes >= prev_bytes )); then
+                observed=$(((bytes - prev_bytes) * 8 / elapsed))
+                allowed=$(( (pacing > prev_pacing ? pacing : prev_pacing) *
+                             110 / 100 + 12 ))
+                (( observed <= allowed )) ||
+                    fail "wire rate ${observed}kbps exceeded pacing ceiling tolerance ${allowed}kbps"
+            fi
+        fi
+        prev_stamp=$stamp
+        prev_line=$line
+    done <"$scenario_dir/samples.log"
+}
+
 finish_scenario() {
     local sender_rc
     set +e
@@ -275,83 +298,121 @@ pass_scenario() {
 }
 
 run_ramp_up() {
-    local stamp line target final media feedback reached=0
+    local stamp line target delivery acked probe_delivery validated_probe
+    local final media feedback reached=0
     begin_scenario ramp_up 1000 8 8 0
     wait_for_samples 1 5
     finish_scenario
     while IFS=$'\t' read -r stamp line; do
         target=$(field_value "$line" target_kbps)
+        acked=$(field_value "$line" acked_kbps)
+        probe_delivery=$(field_value "$line" probe_delivery_kbps)
+        validated_probe=$(field_value "$line" validated_probe_kbps)
+        delivery=$((acked > probe_delivery ? acked : probe_delivery))
+        (( validated_probe > delivery )) && delivery=$validated_probe
         if (( stamp - scenario_start_ms <= 5000 && target >= 5000 )); then
-            reached=1
+            (( delivery >= 3750 )) && reached=1
         fi
     done <"$scenario_dir/samples.log"
-    (( reached == 1 )) || fail "target never reached 5000kbps by stats t=5s"
+    (( reached == 1 )) ||
+        fail "target/delivery did not reach 5000/3750kbps by stats t=5s"
     final=$(tail -1 "$scenario_dir/samples.log")
     line=${final#*$'\t'}
     media=$(field_value "$line" media_sent)
     feedback=$(field_value "$line" feedback_matched)
     (( media > 100 && feedback > 50 )) ||
         fail "traffic counters below threshold: media_sent=$media feedback_matched=$feedback"
+    verify_egress_ceiling
     pass_scenario
     echo "PASS ramp_up"
 }
 
 run_recovery() {
-    local change_ms stamp line target reached=0
+    local change_ms stamp line target acked probe_delivery validated_probe
+    local delivery
+    local pre_line pre_target reached=0
     begin_scenario recovery 1500 19 1.5 0
     wait_from_first_stats 8000
+    pre_line=$(tail -1 "$scenario_dir/samples.log")
+    pre_line=${pre_line#*$'\t'}
+    pre_target=$(field_value "$pre_line" target_kbps)
+    (( pre_target <= 2200 )) ||
+        fail "pre-recovery target was not capacity-limited: $pre_target"
     apply_netem 6 "$DELAY_MS" 0
     change_ms=$(now_ms)
     echo "recovery capacity change at ${change_ms}ms: 1.5mbit -> 6mbit"
     finish_scenario
     while IFS=$'\t' read -r stamp line; do
         target=$(field_value "$line" target_kbps)
+        acked=$(field_value "$line" acked_kbps)
+        probe_delivery=$(field_value "$line" probe_delivery_kbps)
+        delivery=$((acked > probe_delivery ? acked : probe_delivery))
+        validated_probe=$(field_value "$line" validated_probe_kbps)
+        (( validated_probe > delivery )) && delivery=$validated_probe
         if (( stamp >= change_ms && stamp - change_ms <= 8000 &&
-              target >= 4500 )); then
+              target >= 4500 && target > pre_target &&
+              delivery >= 3375 )); then
             reached=1
         fi
     done <"$scenario_dir/samples.log"
     (( reached == 1 )) ||
-        fail "target never reached 4500kbps within 8s of recovery"
+        fail "target/delivery never recovered to 4500/3375kbps within 8s"
+    verify_egress_ceiling
     pass_scenario
     echo "PASS recovery"
 }
 
 run_capacity_drop() {
-    local before change_ms stamp line target pacer low_stamp=0 queue_ok=0
+    local before change_ms stamp line to pacer pre_line pre_target
+    local low_stamp=0 window_queue_ok=0 queue_consecutive=0 queue_ok=0
     begin_scenario capacity_drop 8000 11 8 0
     wait_from_first_stats 5000
     before=$(sample_count)
     wait_for_samples "$((before + 1))" 2
+    pre_line=$(tail -1 "$scenario_dir/samples.log")
+    pre_line=${pre_line#*$'\t'}
+    pre_target=$(field_value "$pre_line" target_kbps)
+    (( pre_target >= 5000 )) ||
+        fail "pre-drop target never established high-rate state: $pre_target"
     # 20 x ~1200B is about 128ms at 1.5mbit, bounding bottleneck latency.
     apply_netem 1.5 "$DELAY_MS" 0 20
     change_ms=$(now_ms)
     echo "capacity drop at ${change_ms}ms: 8mbit -> 1.5mbit"
     finish_scenario
     while IFS=$'\t' read -r stamp line; do
-        target=$(field_value "$line" target_kbps)
-        pacer=$(field_value "$line" pacer_queue_ms)
+        [[ "$line" == "gcc_transition event=rate "* ]] || continue
+        to=$(field_value "$line" to_kbps)
         if (( stamp >= change_ms && stamp - change_ms <= 1500 &&
-              target <= 2200 && low_stamp == 0 )); then
+              to <= 2200 && low_stamp == 0 )); then
             low_stamp=$stamp
         fi
+    done <"$scenario_dir/transitions.log"
+    while IFS=$'\t' read -r stamp line; do
+        pacer=$(field_value "$line" pacer_queue_ms)
         if (( stamp >= change_ms && stamp - change_ms <= 1500 &&
-              target <= 2200 )); then
-            if (( low_stamp > 0 && stamp >= low_stamp && pacer <= 250 )); then
-                queue_ok=1
-            fi
+              pacer <= 250 )); then
+            window_queue_ok=1
+        fi
+        if (( low_stamp > 0 && stamp >= low_stamp && pacer <= 100 )); then
+            queue_consecutive=$((queue_consecutive + 1))
+            (( queue_consecutive >= 2 )) && queue_ok=1
+        elif (( low_stamp > 0 && stamp >= low_stamp )); then
+            queue_consecutive=0
         fi
     done <"$scenario_dir/samples.log"
     (( low_stamp > 0 )) ||
         fail "target did not fall to 2200kbps within 1.5s"
+    (( window_queue_ok == 1 )) ||
+        fail "pacer_queue_ms did not fall to 250ms within 1.5s"
     (( queue_ok == 1 )) ||
-        fail "pacer_queue_ms did not reach 250ms or less after backoff"
+        fail "pacer_queue_ms did not stay <=100ms for two samples after backoff"
     pass_scenario
     echo "PASS capacity_drop"
 }
 
 run_random_loss() {
-    local first last stamp line target consecutive=0
+    local first last stamp line target loss final media feedback
+    local consecutive=0 observed_loss=0
     begin_scenario random_loss 2000 14 6 3
     wait_for_samples 1 5
     finish_scenario
@@ -361,6 +422,8 @@ run_random_loss() {
         fail "random_loss stats span was less than 10 seconds"
     while IFS=$'\t' read -r stamp line; do
         target=$(field_value "$line" target_kbps)
+        loss=$(field_value "$line" loss_q8)
+        (( loss > 0 )) && observed_loss=1
         if (( target < 1000 )); then
             consecutive=$((consecutive + 1))
             (( consecutive < 3 )) ||
@@ -369,6 +432,12 @@ run_random_loss() {
             consecutive=0
         fi
     done <"$scenario_dir/samples.log"
+    final=$(tail -1 "$scenario_dir/samples.log")
+    line=${final#*$'\t'}
+    media=$(field_value "$line" media_sent)
+    feedback=$(field_value "$line" feedback_matched)
+    (( observed_loss == 1 && media > 100 && feedback > 50 )) ||
+        fail "random loss lacked observed loss or live traffic"
     pass_scenario
     echo "PASS random_loss"
 }
@@ -388,12 +457,13 @@ run_heavy_loss() {
         [[ "$reason" == loss ]] || continue
         from=$(field_value "$line" from_kbps)
         to=$(field_value "$line" to_kbps)
-        if (( to < from )); then
+        if (( stamp - scenario_start_ms <= 1500 &&
+              to < from && to * 2 <= from + 1 )); then
             found=1
         fi
     done <"$scenario_dir/transitions.log"
     (( found == 1 )) ||
-        fail "no decreasing gcc_transition event=rate reason=loss"
+        fail "no half-rate loss backoff within 1.5s"
     pass_scenario
     echo "PASS heavy_loss"
 }

@@ -248,6 +248,12 @@ Delay overuse and loss-triggered decreases bypass the increase debounce:
 The 50-percent guard protects against malformed or transient feedback. It is
 not a timer and must not delay subsequent congestion responses.
 
+The delay detector, rather than elapsed wall-clock time, defines a delay
+overuse episode. The first lower target in an episode applies immediately.
+Further delay reductions are latched until razor reports a non-overusing,
+non-decreasing result. A non-decreasing callback received while the detector
+is still overusing cannot rearm the latch. Loss decisions bypass this latch.
+
 ### 6.3 Controlled increase
 
 Normal non-probe increases remain conservative:
@@ -383,12 +389,16 @@ needs more specific behavior than the initial design:
   always emit a lower target even though the outer feedback loss was already
   high. A C++ `OuterLossBackoff` is therefore an emergency fallback: rolling
   256-packet loss strictly above Q8 value 25 halves the current target through
-  `RatePolicy`, no more often than `max(250 ms, RTT)` within one sustained
-  high-loss episode. It is disabled for probe-related feedback; low loss resets
-  the episode, so a later high-loss episode may back off immediately. This is
-  not the removed proportional loss multiplier; it is a thresholded,
-  rate-limited congestion event whose random-loss and heavy-loss behavior is
-  covered by the tc/netem matrix.
+  `RatePolicy` once per sustained high-loss episode, and only when razor did
+  not already reduce the target for that feedback. It is disabled for
+  probe-related feedback; loss at or below the threshold resets the episode,
+  so a later high-loss episode may back off immediately. Razor's own valid
+  repeated loss decisions remain immediate. Limiting only the fallback avoids
+  a positive-feedback trap where the same rolling loss window repeatedly
+  halves pacing, prevents enough new packets from arriving to clear that
+  window, and drives the target to its minimum. This is not the removed
+  proportional loss multiplier; it is a thresholded congestion event whose
+  random-loss and heavy-loss behavior is covered by the tc/netem matrix.
 
 The explicit probe pacing rate is restored by the C++ razor wrapper after
 razor bitrate callbacks, because those callbacks internally recompute the

@@ -66,7 +66,10 @@ sender 与 demo 都支持：
 协议 v4 使用 16 字节 network-order header，后接最多 256 字节的 razor
 payload；它与旧 v3 二进制不兼容。反馈走 RTP 端口 + 1。
 `loss_q8` 使用最近 256 个扩展 transport sequence 的滚动窗口；
-非 probe 反馈持续高于 25/255 时，发送端按 RTT（至少 250ms）快速回退。
+非 probe 反馈首次高于 25/255 且 razor 没有自行降低目标时，C++ 外层兜底会
+立即将目标减半；同一连续高丢包 episode 不重复兜底，回到阈值后才重新武装，
+避免旧滚动窗口把目标连续减到最小值。razor 自身产生的有效 loss 降速仍会
+立即执行。
 
 | 偏移 | 字段 | 大小 | 说明 |
 |---:|---|---:|---|
@@ -98,7 +101,10 @@ sender 每秒以及退出前输出一行 `gcc_stats`：
 - `encoder_kbps`、`target_kbps`、`pacing_kbps`：编码、网络目标和 pacer 速率；
 - `acked_kbps`、`probe_delivery_kbps`、`loss_q8`、`rtt_ms`、`delay_state`：
   razor 平滑确认速率、当前 probe 的独立交付速率和拥塞状态；
-- `media_sent`、`probe_sent`：实际经 pacer 发出的包数；
+- `media_sent`、`probe_sent`：实际经 pacer 发出的媒体包和 padding 包数；
+- `probe_cluster_sent`：probe 窗口内实际发送的媒体加 padding 包数；
+- `wire_bytes`：成功写入 UDP 的累计字节数，可用于核对实际线速；
+- `validated_probe_kbps`：最近一次已通过反馈验证并接受的 probe 速率；
 - `feedback`、`feedback_matched`：收到的反馈与匹配发送历史的反馈数；
 - `pacer_queue_ms`、`ingress_bytes`：pacer 与 appsink ingress 积压；
 - `probe_state`：`idle/probing/waiting/accepted/failed`。
