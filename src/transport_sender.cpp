@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <limits>
@@ -128,6 +130,7 @@ struct TransportSender::Impl {
             Packet{std::move(packet), probe, probe_epoch, header});
         ingress_byte_count += packet_size;
         queued_byte_count.fetch_add(packet_size);
+        ingress_ready.notify_one();
         return true;
     }
 
@@ -136,6 +139,7 @@ struct TransportSender::Impl {
     const size_t max_ingress_bytes;
 
     mutable std::mutex ingress_mutex;
+    std::condition_variable ingress_ready;
     std::deque<Packet> ingress;
     size_t ingress_byte_count = 0;
     std::atomic<uint64_t> dropped{0};
@@ -244,7 +248,25 @@ size_t TransportSender::CancelProbeEpoch(uint64_t probe_epoch) {
             current->second.probe_epoch == probe_epoch) {
             impl_->queued_byte_count.fetch_sub(
                 current->second.bytes.size());
-            impl_->cancelled_ids.insert(current->first);
+            const uint32_t packet_id = current->first;
+            if (impl_->vendor_callback_pending.erase(packet_id) > 0U) {
+                impl_->cancelled_ids.insert(packet_id);
+            } else {
+                impl_->scheduled_ids.erase(packet_id);
+                const auto erase_scheduled =
+                    [packet_id](std::deque<Impl::ScheduledPacket>& queue) {
+                        queue.erase(
+                            std::remove_if(
+                                queue.begin(), queue.end(),
+                                [packet_id](
+                                    const Impl::ScheduledPacket& item) {
+                                    return item.packet_id == packet_id;
+                                }),
+                            queue.end());
+                    };
+                erase_scheduled(impl_->scheduled_probe);
+                erase_scheduled(impl_->scheduled_media);
+            }
             current = impl_->paced.erase(current);
             ++cancelled;
         } else {
@@ -252,6 +274,28 @@ size_t TransportSender::CancelProbeEpoch(uint64_t probe_epoch) {
         }
     }
     return cancelled;
+}
+
+size_t TransportSender::DiscardPending() {
+    size_t discarded = 0U;
+    {
+        std::lock_guard<std::mutex> lock(impl_->ingress_mutex);
+        discarded += impl_->ingress.size();
+        impl_->ingress.clear();
+        impl_->ingress_byte_count = 0U;
+    }
+    discarded += impl_->paced.size();
+    impl_->paced.clear();
+    impl_->scheduled_probe.clear();
+    impl_->scheduled_media.clear();
+    impl_->scheduled_ids.clear();
+    impl_->cancelled_ids.insert(
+        impl_->vendor_callback_pending.begin(),
+        impl_->vendor_callback_pending.end());
+    impl_->vendor_callback_pending.clear();
+    impl_->queued_byte_count.store(0U);
+    impl_->active_probe_epoch = 0U;
+    return discarded;
 }
 
 size_t TransportSender::DrainIngress(const PacerAddFunction& add) {
@@ -288,6 +332,8 @@ size_t TransportSender::DrainIngress(const PacerAddFunction& add) {
             // strict C++ egress remains the aggregate wire-rate authority;
             // razor still receives the packet for its send history.
             SchedulePaced(packet_id);
+            impl_->vendor_callback_pending.insert(packet_id);
+        } else {
             impl_->vendor_callback_pending.insert(packet_id);
         }
 
@@ -510,6 +556,40 @@ size_t TransportSender::FlushPaced(const SentFunction& on_sent) {
     return sent_count;
 }
 
+bool TransportSender::NextPacingDelayUs(uint64_t& out_delay_us) {
+    out_delay_us = 0U;
+    if (impl_->scheduled_probe.empty() &&
+        impl_->scheduled_media.empty()) {
+        return false;
+    }
+    if (impl_->next_send_time_us == 0U || !impl_->clock) {
+        return true;
+    }
+    uint64_t now_us = 0U;
+    try {
+        now_us = impl_->clock();
+    } catch (...) {
+        return true;
+    }
+    out_delay_us = now_us >= impl_->next_send_time_us
+                       ? 0U
+                       : impl_->next_send_time_us - now_us;
+    return true;
+}
+
+void TransportSender::WaitForPacingOrIngress(uint64_t maximum_idle_us) {
+    uint64_t wait_us = maximum_idle_us;
+    uint64_t pacing_delay_us = 0U;
+    if (NextPacingDelayUs(pacing_delay_us)) {
+        wait_us = std::min(wait_us, pacing_delay_us);
+    }
+    if (wait_us == 0U) return;
+    std::unique_lock<std::mutex> lock(impl_->ingress_mutex);
+    if (!impl_->ingress.empty()) return;
+    impl_->ingress_ready.wait_for(
+        lock, std::chrono::microseconds(wait_us));
+}
+
 uint32_t TransportSender::PacingQueueDelayMs() {
     if (!impl_->clock) {
         return 0U;
@@ -610,6 +690,10 @@ uint64_t TransportSender::sent_packets() const {
 
 size_t TransportSender::queued_bytes() const {
     return impl_->queued_byte_count.load();
+}
+
+size_t TransportSender::pending_cancelled_callbacks() const {
+    return impl_->cancelled_ids.size();
 }
 
 TransportSender::SendFunction CreateUdpSendFunction(

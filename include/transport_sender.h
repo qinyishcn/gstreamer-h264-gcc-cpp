@@ -70,6 +70,7 @@ public:
     bool EnqueueProbe(std::vector<uint8_t> packet, uint64_t probe_epoch);
     uint64_t BeginProbeEpoch();
     size_t CancelProbeEpoch(uint64_t probe_epoch);
+    size_t DiscardPending();
 
     // All methods below except the atomic/mutex-backed metric getters are
     // control-thread-only. Pacer callbacks must return on the calling thread.
@@ -88,6 +89,8 @@ public:
     void SetPacingRate(uint32_t bitrate_kbps);
     bool SchedulePaced(uint32_t packet_id);
     size_t FlushPaced(const SentFunction& on_sent);
+    bool NextPacingDelayUs(uint64_t& out_delay_us);
+    void WaitForPacingOrIngress(uint64_t maximum_idle_us);
     uint32_t PacingQueueDelayMs();
     bool LookupSentPacket(uint16_t sequence, SentPacketInfo& out) const;
     bool GetSentHistoryWatermark(SentHistoryWatermark& out) const;
@@ -98,6 +101,7 @@ public:
     uint64_t dropped_packets() const;
     uint64_t sent_packets() const;
     size_t queued_bytes() const;
+    size_t pending_cancelled_callbacks() const;
 
 private:
     struct Impl;

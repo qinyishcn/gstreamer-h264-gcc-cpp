@@ -1103,17 +1103,14 @@ int main(int argc, char* argv[]) {
             loop_error = true;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        transport.WaitForPacingOrIngress(2000U);
     }
 
+    handle_probe(probe_controller.Cancel(SteadyMillis()));
+    report_probe_transition();
     stop_sender_production();
-    transport.DrainIngress(
-        [&](uint32_t packet_id, size_t size) {
-            const bool accepted =
-                razor_tx.add_packet(packet_id, false, size);
-            process_control_events();
-            return accepted;
-        });
+    transport.DiscardPending();
+    razor_tx.set_pacing_rate(kMaxPacingKbps);
     process_control_events();
     const uint64_t drain_deadline = SteadyMicros() + kDrainTimeoutUs;
     bool drained = false;

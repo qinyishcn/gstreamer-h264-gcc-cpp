@@ -1,4 +1,5 @@
 #include "probe_delivery_estimator.h"
+#include "probe_controller.h"
 #include "transport_sender.h"
 #include "test_support.h"
 
@@ -594,13 +595,19 @@ int TestPacingRateDecreaseReschedulesExistingDeadline() {
              static_cast<size_t>(2));
     CHECK_TRUE(sender.SchedulePaced(ids[0]));
     CHECK_TRUE(sender.SchedulePaced(ids[1]));
+    uint64_t delay_us = 99U;
+    CHECK_TRUE(sender.NextPacingDelayUs(delay_us));
+    CHECK_EQ(delay_us, static_cast<uint64_t>(0));
     CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
 
     sender.SetPacingRate(1000U);
+    CHECK_TRUE(sender.NextPacingDelayUs(delay_us));
+    CHECK_EQ(delay_us, static_cast<uint64_t>(10000));
     now_us = 1251U;
     CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
     now_us = 10001U;
     CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+    CHECK_TRUE(!sender.NextPacingDelayUs(delay_us));
     return EXIT_SUCCESS;
 }
 
@@ -661,6 +668,7 @@ int TestCancelledProbeEpochNeverReachesWireOrHistory() {
     CHECK_EQ(datagrams, static_cast<size_t>(1));
     CHECK_TRUE(sender.SchedulePaced(ids[1]));
     CHECK_EQ(sender.CancelProbeEpoch(epoch), static_cast<size_t>(1));
+    CHECK_EQ(sender.pending_cancelled_callbacks(), static_cast<size_t>(0));
     now_us += 1000000U;
     CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
     CHECK_EQ(datagrams, static_cast<size_t>(1));
@@ -692,7 +700,8 @@ int TestCancelledProbeEpochNeverReachesWireOrHistory() {
 int TestCancelledProbeBeforeVendorCallbackIsHarmless() {
     gcc::TransportSender sender(
         [](const uint8_t*, size_t) { return true; },
-        []() { return uint64_t{1}; }, 2000U);
+        []() { return uint64_t{1}; }, 2000U, UINT32_MAX);
+    sender.SetPacingRate(1000U);
     const std::vector<uint8_t> media = MakePacket(20U);
     gcc::RtpHeader header;
     CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), header));
@@ -707,8 +716,62 @@ int TestCancelledProbeBeforeVendorCallbackIsHarmless() {
                  }),
              static_cast<size_t>(1));
     CHECK_EQ(sender.CancelProbeEpoch(epoch), static_cast<size_t>(1));
+    CHECK_EQ(sender.pending_cancelled_callbacks(), static_cast<size_t>(1));
     CHECK_TRUE(sender.SchedulePaced(id));
+    CHECK_EQ(sender.pending_cancelled_callbacks(), static_cast<size_t>(0));
     CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    const uint64_t next_epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), next_epoch));
+    uint32_t wrapped_id = UINT32_MAX;
+    CHECK_EQ(sender.DrainIngress(
+                 [&wrapped_id](uint32_t packet_id, size_t) {
+                     wrapped_id = packet_id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_EQ(wrapped_id, static_cast<uint32_t>(0));
+    CHECK_TRUE(sender.SchedulePaced(wrapped_id));
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+    return EXIT_SUCCESS;
+}
+
+int TestShutdownCancelsActiveProbeWithoutGrowingHistory() {
+    gcc::ProbeController controller;
+    CHECK_TRUE(controller.OnStableTarget(1000U, 1U).start);
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        []() { return uint64_t{1000}; }, 2000U);
+    const std::vector<uint8_t> media = MakePacket(20U);
+    gcc::RtpHeader header;
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), header));
+    const uint64_t epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), epoch));
+    CHECK_TRUE(sender.EnqueueMedia(media));
+    uint32_t probe_id = 0U;
+    uint32_t media_id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&probe_id, &media_id](uint32_t packet_id, size_t size) {
+                     if (size == 250U) {
+                         probe_id = packet_id;
+                     } else {
+                         media_id = packet_id;
+                     }
+                     return true;
+                 }),
+             static_cast<size_t>(2));
+    CHECK_TRUE(sender.SchedulePaced(probe_id));
+    CHECK_TRUE(controller.Cancel(2U).stop);
+    CHECK_EQ(sender.CancelProbeEpoch(epoch), static_cast<size_t>(1));
+    CHECK_EQ(sender.DiscardPending(), static_cast<size_t>(1));
+    CHECK_EQ(sender.pending_packets(), static_cast<size_t>(0));
+    CHECK_EQ(sender.pending_cancelled_callbacks(), static_cast<size_t>(1));
+    CHECK_TRUE(sender.SchedulePaced(media_id));
+    CHECK_EQ(sender.pending_cancelled_callbacks(), static_cast<size_t>(0));
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    gcc::SentHistoryWatermark watermark;
+    CHECK_TRUE(!sender.GetSentHistoryWatermark(watermark));
     return EXIT_SUCCESS;
 }
 
@@ -1020,6 +1083,8 @@ int main() {
     CHECK_EQ(TestCancelledProbeEpochNeverReachesWireOrHistory(),
              EXIT_SUCCESS);
     CHECK_EQ(TestCancelledProbeBeforeVendorCallbackIsHarmless(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestShutdownCancelsActiveProbeWithoutGrowingHistory(),
              EXIT_SUCCESS);
     CHECK_EQ(TestMediaSentDuringProbeBelongsToAggregateCluster(),
              EXIT_SUCCESS);

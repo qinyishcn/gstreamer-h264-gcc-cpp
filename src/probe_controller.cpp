@@ -151,6 +151,15 @@ ProbeAction ProbeController::OnTimer(uint64_t now_ms) {
     return AdvanceTime(NormalizeTime(now_ms));
 }
 
+ProbeAction ProbeController::Cancel(uint64_t now_ms) {
+    const uint64_t event_ms = NormalizeTime(now_ms);
+    if (state_ != ProbeState::Probing &&
+        state_ != ProbeState::WaitingForResult) {
+        return ProbeAction{};
+    }
+    return Fail(event_ms, true);
+}
+
 ProbeAction ProbeController::OnPacerQueueDelay(
     uint32_t queue_delay_ms, uint64_t now_ms) {
     constexpr uint32_t kMaximumPacerQueueMs = 250U;

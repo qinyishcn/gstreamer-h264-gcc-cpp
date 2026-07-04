@@ -13,12 +13,13 @@ receiver 或 demo 的控制路径。
 ```text
 GStreamer videotestsrc -> x264enc -> rtph264pay -> appsink
     -> bounded TransportSender ingress
-    -> razor pacer -> UDP
+    -> razor callback -> C++ strict aggregate egress -> UDP
+    -> successful UDP send -> RTP sequence + send history
 ```
 
 `appsink` 回调只复制并排队 RTP 包。`TransportSender` 为媒体包和 probe 包分配
-同一套 transport sequence，并在 razor pacer 真正发送后记录真实包大小和发送
-时间。回调只追加原始事件；速率决策、反馈处理、probe 状态机和 razor heartbeat
+同一套 transport sequence；只有 UDP 成功发送后才递增 on-wire RTP sequence，
+并记录真实包大小和发送时间。回调只追加原始事件；速率决策、反馈处理、probe 状态机和 razor heartbeat
 都由 serialized control thread 顺序执行，避免控制器重入。
 
 receiver 先把 RTP 到达事件放入有界 arrival queue。probe RTP 会送入 razor

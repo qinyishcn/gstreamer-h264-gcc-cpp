@@ -413,6 +413,16 @@ int TestInvalidConfigurationAndNumericLimits() {
     return EXIT_SUCCESS;
 }
 
+int TestExplicitCancelStopsActiveProbe() {
+    ProbeController controller;
+    CHECK_TRUE(controller.OnStableTarget(1000U, 10U).start);
+    const ProbeAction cancelled = controller.Cancel(11U);
+    CHECK_TRUE(cancelled.stop);
+    CHECK_EQ(controller.state(), ProbeState::Failed);
+    CHECK_TRUE(!controller.Cancel(12U).stop);
+    return EXIT_SUCCESS;
+}
+
 }  // namespace
 
 int main() {
@@ -435,5 +445,6 @@ int main() {
     CHECK_EQ(TestByteCountingSaturatesAndIgnoresInactive(), EXIT_SUCCESS);
     CHECK_EQ(TestExcessivePacerQueueAbortsActiveProbe(), EXIT_SUCCESS);
     CHECK_EQ(TestInvalidConfigurationAndNumericLimits(), EXIT_SUCCESS);
+    CHECK_EQ(TestExplicitCancelStopsActiveProbe(), EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

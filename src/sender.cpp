@@ -959,9 +959,11 @@ int main(int argc, char* argv[]) {
             print_stats();
             last_stats_us = now_us;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        transport.WaitForPacingOrIngress(2000U);
     }
 
+    handle_probe_action(probe_controller.Cancel(SteadyMillis()));
+    report_probe_transition();
     // Stop production before draining every packet already accepted by the
     // transport and razor pacer.
     sink_context.accepting.store(false);
@@ -971,13 +973,8 @@ int main(int argc, char* argv[]) {
         g_signal_handler_disconnect(app_sink, sample_handler);
     }
 
-    transport.DrainIngress(
-        [&](uint32_t packet_id, size_t size) {
-            const bool accepted =
-                razor_sender.add_packet(packet_id, false, size);
-            process_control_events();
-            return accepted;
-        });
+    transport.DiscardPending();
+    razor_sender.set_pacing_rate(kMaxNormalPacingKbps);
     process_control_events();
 
     const uint64_t drain_deadline_us =

@@ -44,6 +44,7 @@ public:
     ProbeAction OnProbePacketSent(uint64_t bytes, uint64_t now_ms);
     ProbeAction OnFeedback(const ProbeFeedback& feedback);
     ProbeAction OnTimer(uint64_t now_ms);
+    ProbeAction Cancel(uint64_t now_ms);
     ProbeAction OnPacerQueueDelay(
         uint32_t queue_delay_ms, uint64_t now_ms);
 
