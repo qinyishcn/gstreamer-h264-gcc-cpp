@@ -46,7 +46,7 @@ void ProbeDeliveryEstimator::Start(uint32_t) {
 
 void ProbeDeliveryEstimator::OnProbePacketSent(
     const SentPacketInfo& packet) {
-    if (!active_ || !packet.probe) {
+    if (!active_ || (!packet.probe && !packet.probe_cluster)) {
         return;
     }
     if (awaiting_first_probe_) {
@@ -139,7 +139,7 @@ bool ProbeDeliveryEstimator::WatermarkPast(
 
 bool ProbeDeliveryEstimator::IsProbeGeneration(
     const SentPacketInfo& packet) const {
-    if (!packet.probe) return false;
+    if (!packet.probe && !packet.probe_cluster) return false;
     for (const ProbeRange& range : probe_ranges_) {
         const bool before_range = PositionAfter(
             range.first_generation, range.first_cumulative_bytes,

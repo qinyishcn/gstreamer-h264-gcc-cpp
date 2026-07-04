@@ -83,7 +83,7 @@ int TestPreservesPacketsAndMetadata() {
     CHECK_TRUE(sender.SendPaced(paced[1].packet_id, second));
     CHECK_EQ(first.transport_sequence, static_cast<uint16_t>(0));
     CHECK_EQ(first.size, static_cast<size_t>(19));
-    CHECK_EQ(first.send_time_us, static_cast<uint64_t>(1010));
+    CHECK_EQ(first.send_time_us, static_cast<uint64_t>(1020));
     CHECK_TRUE(!first.probe);
     CHECK_EQ(first.cumulative_sent_bytes, static_cast<uint64_t>(19));
     CHECK_EQ(first.generation, static_cast<uint64_t>(0));
@@ -525,6 +525,251 @@ int TestProbeAdmissionRequiresGccProbe() {
     return EXIT_SUCCESS;
 }
 
+int TestStrictEgressCeilingSerializesAgedBacklog() {
+    uint64_t now_us = 1000000U;
+    std::vector<uint64_t> send_times;
+    gcc::TransportSender sender(
+        [&send_times, &now_us](const uint8_t*, size_t) {
+            send_times.push_back(now_us);
+            return true;
+        },
+        [&now_us]() { return now_us; }, 5000U);
+    sender.SetPacingRate(1000U);
+    for (size_t i = 0; i < 3U; ++i) {
+        CHECK_TRUE(sender.EnqueueMedia(MakePacket(1250U)));
+    }
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             static_cast<size_t>(3));
+    for (uint32_t id : ids) {
+        CHECK_TRUE(sender.SchedulePaced(id));
+    }
+
+    std::vector<gcc::SentPacket> completed;
+    CHECK_EQ(sender.FlushPaced(
+                 [&completed](const gcc::SentPacket& packet) {
+                     completed.push_back(packet);
+                 }),
+             static_cast<size_t>(1));
+    CHECK_EQ(send_times.size(), static_cast<size_t>(1));
+    now_us += 9999U;
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    now_us += 1U;
+    CHECK_EQ(sender.FlushPaced(
+                 [&completed](const gcc::SentPacket& packet) {
+                     completed.push_back(packet);
+                 }),
+             static_cast<size_t>(1));
+    CHECK_EQ(send_times.size(), static_cast<size_t>(2));
+    CHECK_EQ(send_times[1] - send_times[0], static_cast<uint64_t>(10000U));
+    now_us += 10000U;
+    CHECK_EQ(sender.FlushPaced(
+                 [&completed](const gcc::SentPacket& packet) {
+                     completed.push_back(packet);
+                 }),
+             static_cast<size_t>(1));
+    CHECK_EQ(completed.size(), static_cast<size_t>(3));
+    CHECK_EQ(sender.pending_packets(), static_cast<size_t>(0));
+    return EXIT_SUCCESS;
+}
+
+int TestCancelledProbeEpochNeverReachesWireOrHistory() {
+    uint64_t now_us = 1000U;
+    size_t datagrams = 0U;
+    gcc::TransportSender sender(
+        [&datagrams](const uint8_t*, size_t) {
+            ++datagrams;
+            return true;
+        },
+        [&now_us]() { return now_us; }, 5000U);
+    sender.SetPacingRate(1000U);
+    const std::vector<uint8_t> media = MakePacket(20U);
+    gcc::RtpHeader header;
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), header));
+    const uint64_t epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), epoch));
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), epoch));
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             static_cast<size_t>(2));
+    CHECK_TRUE(sender.SchedulePaced(ids[0]));
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+    CHECK_EQ(datagrams, static_cast<size_t>(1));
+    CHECK_TRUE(sender.SchedulePaced(ids[1]));
+    CHECK_EQ(sender.CancelProbeEpoch(epoch), static_cast<size_t>(1));
+    now_us += 1000000U;
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    CHECK_EQ(datagrams, static_cast<size_t>(1));
+    CHECK_EQ(sender.pending_packets(), static_cast<size_t>(0));
+    gcc::SentPacketInfo info;
+    CHECK_TRUE(sender.LookupSentPacket(
+        static_cast<uint16_t>(ids[0]), info));
+    CHECK_TRUE(!sender.LookupSentPacket(
+        static_cast<uint16_t>(ids[1]), info));
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(20U)));
+    uint32_t media_id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&media_id](uint32_t packet_id, size_t) {
+                     media_id = packet_id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(sender.SchedulePaced(media_id));
+    gcc::SentPacket media_sent;
+    CHECK_EQ(sender.FlushPaced(
+                 [&media_sent](const gcc::SentPacket& packet) {
+                     media_sent = packet;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_EQ(media_sent.transport_sequence, static_cast<uint16_t>(1));
+    return EXIT_SUCCESS;
+}
+
+int TestCancelledProbeBeforeVendorCallbackIsHarmless() {
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        []() { return uint64_t{1}; }, 2000U);
+    const std::vector<uint8_t> media = MakePacket(20U);
+    gcc::RtpHeader header;
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), header));
+    const uint64_t epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), epoch));
+    uint32_t id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&id](uint32_t packet_id, size_t) {
+                     id = packet_id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_EQ(sender.CancelProbeEpoch(epoch), static_cast<size_t>(1));
+    CHECK_TRUE(sender.SchedulePaced(id));
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    return EXIT_SUCCESS;
+}
+
+int TestMediaSentDuringProbeBelongsToAggregateCluster() {
+    uint64_t now_us = 1U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        [&now_us]() { return now_us; }, 100U);
+    sender.SetPacingRate(1000U);
+    const uint64_t epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(20U)));
+    uint32_t id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&id](uint32_t packet_id, size_t) {
+                     id = packet_id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(sender.SchedulePaced(id));
+    gcc::SentPacket sent;
+    CHECK_EQ(sender.FlushPaced(
+                 [&sent](const gcc::SentPacket& packet) {
+                     sent = packet;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(!sent.probe);
+    CHECK_TRUE(sent.probe_cluster);
+    sender.CancelProbeEpoch(epoch);
+    return EXIT_SUCCESS;
+}
+
+int TestStrictEgressReportsScheduledQueueDelay() {
+    uint64_t now_us = 1000U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        [&now_us]() { return now_us; }, 100U);
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(20U)));
+    uint32_t id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&id](uint32_t packet_id, size_t) {
+                     id = packet_id;
+                     return true;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(sender.SchedulePaced(id));
+    CHECK_EQ(sender.PacingQueueDelayMs(), static_cast<uint32_t>(0));
+    now_us += 251000U;
+    CHECK_EQ(sender.PacingQueueDelayMs(), static_cast<uint32_t>(251));
+    return EXIT_SUCCESS;
+}
+
+int TestProbeCanEnterStrictEgressBeforeVendorBacklog() {
+    uint64_t now_us = 1U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        [&now_us]() { return now_us; }, 500U);
+    sender.SetPacingRate(2000U);
+    const std::vector<uint8_t> media = MakePacket(20U);
+    gcc::RtpHeader header;
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), header));
+    const uint64_t epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), epoch));
+    CHECK_EQ(sender.DrainIngress(
+                 [](uint32_t, size_t) { return true; }),
+             static_cast<size_t>(1));
+    gcc::SentPacket sent;
+    CHECK_EQ(sender.FlushPaced(
+                 [&sent](const gcc::SentPacket& packet) {
+                     sent = packet;
+                 }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(sent.probe);
+    CHECK_TRUE(sender.SchedulePaced(0U));
+    return EXIT_SUCCESS;
+}
+
+int TestReadyMediaCarriesProbeClusterBeforePadding() {
+    uint64_t now_us = 1U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        [&now_us]() { return now_us; }, 500U);
+    sender.SetPacingRate(1000U);
+    const std::vector<uint8_t> media = MakePacket(20U);
+    gcc::RtpHeader header;
+    CHECK_TRUE(gcc::ParseRtpHeader(media.data(), media.size(), header));
+    const uint64_t epoch = sender.BeginProbeEpoch();
+    CHECK_TRUE(sender.EnqueueProbe(
+        gcc::BuildProbeRtpPacket(header, 0U, 250U), epoch));
+    CHECK_TRUE(sender.EnqueueMedia(media));
+    uint32_t media_id = 0U;
+    CHECK_EQ(sender.DrainIngress(
+                 [&media_id](uint32_t packet_id, size_t size) {
+                     if (size == 20U) media_id = packet_id;
+                     return true;
+                 }),
+             static_cast<size_t>(2));
+    CHECK_TRUE(sender.SchedulePaced(media_id));
+
+    gcc::SentPacket first;
+    CHECK_EQ(sender.FlushPaced(
+                 [&first](const gcc::SentPacket& sent) { first = sent; }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(!first.probe);
+    CHECK_TRUE(first.probe_cluster);
+
+    now_us += 2000000U;
+    gcc::SentPacket second;
+    CHECK_EQ(sender.FlushPaced(
+                 [&second](const gcc::SentPacket& sent) { second = sent; }),
+             static_cast<size_t>(1));
+    CHECK_TRUE(second.probe);
+    return EXIT_SUCCESS;
+}
+
 int TestReentrantSendCannotSendTwice() {
     gcc::TransportSender* sender_ptr = nullptr;
     uint32_t active_id = 0;
@@ -631,7 +876,7 @@ int TestHistoryEvictsAfterTwoThousand() {
     return EXIT_SUCCESS;
 }
 
-int TestHistoryEvictionKeepsNewestWrappedSequence() {
+int TestRejectedPacerIdsDoNotAdvanceTransportSequence() {
     constexpr uint32_t kInitialPacketId = 65534;
     constexpr uint64_t kConstantSendTime = 777;
     gcc::TransportSender sender(
@@ -651,8 +896,8 @@ int TestHistoryEvictionKeepsNewestWrappedSequence() {
     CHECK_TRUE(sender.SendPaced(first_id, first));
     CHECK_EQ(first.transport_sequence, static_cast<uint16_t>(65534));
 
-    // Advance the 32-bit ID without adding send-history entries. The next
-    // accepted packet then has the same low 16-bit transport sequence.
+    // Pacer IDs identify queued objects, not on-wire RTP sequence numbers.
+    // Rejected/cancelled objects must not create receiver-visible gaps.
     for (uint32_t i = 0; i < 65535; ++i) {
         CHECK_TRUE(sender.EnqueueMedia(MakePacket(12)));
         CHECK_EQ(sender.DrainIngress(
@@ -661,37 +906,17 @@ int TestHistoryEvictionKeepsNewestWrappedSequence() {
     }
 
     CHECK_TRUE(sender.EnqueueMedia(MakePacket(12)));
-    uint32_t duplicate_id = 0;
+    uint32_t later_id = 0;
     CHECK_EQ(sender.DrainIngress(
-                 [&duplicate_id](uint32_t packet_id, size_t) {
-                     duplicate_id = packet_id;
+                 [&later_id](uint32_t packet_id, size_t) {
+                     later_id = packet_id;
                      return true;
                  }),
              static_cast<size_t>(1));
-    CHECK_EQ(duplicate_id, kInitialPacketId + 65536);
-    gcc::SentPacket duplicate;
-    CHECK_TRUE(sender.SendPaced(duplicate_id, duplicate));
-    CHECK_EQ(duplicate.transport_sequence, first.transport_sequence);
-
-    // Reach 2001 successful sends. Evicting the old generation must not
-    // remove the newer map record with the same sequence and timestamp.
-    for (uint32_t i = 0; i < 1999; ++i) {
-        CHECK_TRUE(sender.EnqueueMedia(MakePacket(12)));
-        uint32_t id = 0;
-        CHECK_EQ(sender.DrainIngress(
-                     [&id](uint32_t packet_id, size_t) {
-                         id = packet_id;
-                         return true;
-                     }),
-                 static_cast<size_t>(1));
-        gcc::SentPacket out;
-        CHECK_TRUE(sender.SendPaced(id, out));
-    }
-
-    uint64_t send_time = 0;
-    CHECK_TRUE(sender.LookupSendTime(
-        duplicate.transport_sequence, send_time));
-    CHECK_EQ(send_time, kConstantSendTime);
+    CHECK_EQ(later_id, kInitialPacketId + 65536);
+    gcc::SentPacket later;
+    CHECK_TRUE(sender.SendPaced(later_id, later));
+    CHECK_EQ(later.transport_sequence, static_cast<uint16_t>(65535));
     return EXIT_SUCCESS;
 }
 
@@ -734,11 +959,24 @@ int main() {
     CHECK_EQ(TestClockFailurePreventsSend(), EXIT_SUCCESS);
     CHECK_EQ(TestReentrantPacerConsumptionIsAccepted(), EXIT_SUCCESS);
     CHECK_EQ(TestProbeAdmissionRequiresGccProbe(), EXIT_SUCCESS);
+    CHECK_EQ(TestStrictEgressCeilingSerializesAgedBacklog(), EXIT_SUCCESS);
+    CHECK_EQ(TestCancelledProbeEpochNeverReachesWireOrHistory(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestCancelledProbeBeforeVendorCallbackIsHarmless(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestMediaSentDuringProbeBelongsToAggregateCluster(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestStrictEgressReportsScheduledQueueDelay(), EXIT_SUCCESS);
+    CHECK_EQ(TestProbeCanEnterStrictEgressBeforeVendorBacklog(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestReadyMediaCarriesProbeClusterBeforePadding(),
+             EXIT_SUCCESS);
     CHECK_EQ(TestReentrantSendCannotSendTwice(), EXIT_SUCCESS);
     CHECK_EQ(TestSequenceWrapKeepsPacketIdsMonotonic(), EXIT_SUCCESS);
     CHECK_EQ(TestPacketIdWrapsModuloUint32(), EXIT_SUCCESS);
     CHECK_EQ(TestHistoryEvictsAfterTwoThousand(), EXIT_SUCCESS);
-    CHECK_EQ(TestHistoryEvictionKeepsNewestWrappedSequence(), EXIT_SUCCESS);
+    CHECK_EQ(TestRejectedPacerIdsDoNotAdvanceTransportSequence(),
+             EXIT_SUCCESS);
     CHECK_EQ(TestUdpFactoryValidatesConfiguration(), EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

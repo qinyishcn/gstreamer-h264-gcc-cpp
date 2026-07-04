@@ -7,6 +7,7 @@
 #include <mutex>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #ifdef _WIN32
@@ -54,6 +55,7 @@ struct TransportSender::Impl {
     struct Packet {
         std::vector<uint8_t> bytes;
         bool probe = false;
+        uint64_t probe_epoch = 0U;
         RtpHeader header;
     };
 
@@ -62,6 +64,11 @@ struct TransportSender::Impl {
         uint64_t generation;
         uint64_t cumulative_sent_bytes;
         uint32_t history_ordinal;
+    };
+
+    struct ScheduledPacket {
+        uint32_t packet_id;
+        uint64_t scheduled_time_us;
     };
 
     Impl(SendFunction send_function, ClockFunction clock_function,
@@ -73,13 +80,16 @@ struct TransportSender::Impl {
           clock(std::move(clock_function)),
           max_ingress_bytes(byte_limit),
           next_packet_id(initial_packet_id),
+          next_transport_sequence(
+              static_cast<uint16_t>(initial_packet_id)),
           next_send_generation(initial_generation),
           cumulative_sent_bytes(initial_cumulative_sent_bytes),
           next_history_ordinal(initial_history_ordinal) {
         send_times.reserve(kSendHistoryLimit);
     }
 
-    bool Enqueue(std::vector<uint8_t> packet, bool probe) {
+    bool Enqueue(std::vector<uint8_t> packet, bool probe,
+                 uint64_t probe_epoch = 0U) {
         RtpHeader header;
         if ((probe &&
              !IsProbeRtpPacket(packet.data(), packet.size())) ||
@@ -94,7 +104,8 @@ struct TransportSender::Impl {
             return false;
         }
         const size_t packet_size = packet.size();
-        ingress.push_back(Packet{std::move(packet), probe, header});
+        ingress.push_back(
+            Packet{std::move(packet), probe, probe_epoch, header});
         ingress_byte_count += packet_size;
         queued_byte_count.fetch_add(packet_size);
         return true;
@@ -112,10 +123,20 @@ struct TransportSender::Impl {
     std::atomic<size_t> queued_byte_count{0};
 
     uint32_t next_packet_id;
+    uint16_t next_transport_sequence;
     uint64_t next_send_generation = 0;
     uint64_t cumulative_sent_bytes = 0;
     uint32_t next_history_ordinal = 0;
     std::unordered_map<uint32_t, Packet> paced;
+    std::deque<ScheduledPacket> scheduled_probe;
+    std::deque<ScheduledPacket> scheduled_media;
+    std::unordered_set<uint32_t> scheduled_ids;
+    std::unordered_set<uint32_t> cancelled_ids;
+    std::unordered_set<uint32_t> vendor_callback_pending;
+    uint32_t pacing_rate_kbps = 0U;
+    uint64_t next_send_time_us = 0U;
+    uint64_t next_probe_epoch = 0U;
+    uint64_t active_probe_epoch = 0U;
     bool has_latest_media_header = false;
     RtpHeader latest_media;
     std::deque<HistoryEntry> history;
@@ -155,6 +176,61 @@ bool TransportSender::EnqueueProbe(std::vector<uint8_t> packet) {
     return impl_->Enqueue(std::move(packet), true);
 }
 
+bool TransportSender::EnqueueProbe(
+    std::vector<uint8_t> packet, uint64_t probe_epoch) {
+    if (probe_epoch == 0U) {
+        return false;
+    }
+    return impl_->Enqueue(std::move(packet), true, probe_epoch);
+}
+
+uint64_t TransportSender::BeginProbeEpoch() {
+    if (impl_->next_probe_epoch <
+        std::numeric_limits<uint64_t>::max()) {
+        ++impl_->next_probe_epoch;
+    }
+    impl_->active_probe_epoch = impl_->next_probe_epoch;
+    return impl_->active_probe_epoch;
+}
+
+size_t TransportSender::CancelProbeEpoch(uint64_t probe_epoch) {
+    if (probe_epoch == 0U) {
+        return 0U;
+    }
+    if (impl_->active_probe_epoch == probe_epoch) {
+        impl_->active_probe_epoch = 0U;
+    }
+    size_t cancelled = 0U;
+    {
+        std::lock_guard<std::mutex> lock(impl_->ingress_mutex);
+        auto current = impl_->ingress.begin();
+        while (current != impl_->ingress.end()) {
+            if (current->probe && current->probe_epoch == probe_epoch) {
+                impl_->ingress_byte_count -= current->bytes.size();
+                impl_->queued_byte_count.fetch_sub(current->bytes.size());
+                current = impl_->ingress.erase(current);
+                ++cancelled;
+            } else {
+                ++current;
+            }
+        }
+    }
+    for (auto current = impl_->paced.begin();
+         current != impl_->paced.end();) {
+        if (current->second.probe &&
+            current->second.probe_epoch == probe_epoch) {
+            impl_->queued_byte_count.fetch_sub(
+                current->second.bytes.size());
+            impl_->cancelled_ids.insert(current->first);
+            current = impl_->paced.erase(current);
+            ++cancelled;
+        } else {
+            ++current;
+        }
+    }
+    return cancelled;
+}
+
 size_t TransportSender::DrainIngress(const PacerAddFunction& add) {
     std::deque<Impl::Packet> drained;
     {
@@ -166,16 +242,8 @@ size_t TransportSender::DrainIngress(const PacerAddFunction& add) {
     size_t accepted = 0;
     for (Impl::Packet& packet : drained) {
         const uint32_t packet_id = impl_->next_packet_id++;
-        if (!RewriteRtpSequence(
-                packet.bytes, static_cast<uint16_t>(packet_id))) {
-            impl_->queued_byte_count.fetch_sub(packet.bytes.size());
-            ++impl_->dropped;
-            continue;
-        }
         if (!packet.probe) {
             impl_->latest_media = packet.header;
-            impl_->latest_media.sequence =
-                static_cast<uint16_t>(packet_id);
             impl_->has_latest_media_header = true;
         }
 
@@ -192,6 +260,13 @@ size_t TransportSender::DrainIngress(const PacerAddFunction& add) {
             ++impl_->dropped;
             continue;
         }
+        if (inserted.first->second.probe) {
+            // Probe padding must not sit behind an aged vendor queue. The
+            // strict C++ egress remains the aggregate wire-rate authority;
+            // razor still receives the packet for its send history.
+            SchedulePaced(packet_id);
+            impl_->vendor_callback_pending.insert(packet_id);
+        }
 
         bool pacer_accepted = false;
         try {
@@ -207,6 +282,7 @@ size_t TransportSender::DrainIngress(const PacerAddFunction& add) {
             continue;
         }
         if (!pacer_accepted) {
+            impl_->vendor_callback_pending.erase(packet_id);
             impl_->paced.erase(packet_id);
             impl_->queued_byte_count.fetch_sub(packet_size);
             ++impl_->dropped;
@@ -226,6 +302,12 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
     Impl::Packet packet = std::move(found->second);
     impl_->paced.erase(found);
     impl_->queued_byte_count.fetch_sub(packet.bytes.size());
+
+    const uint16_t sequence = impl_->next_transport_sequence;
+    if (!RewriteRtpSequence(packet.bytes, sequence)) {
+        ++impl_->dropped;
+        return false;
+    }
 
     uint64_t send_time_us = 0;
     try {
@@ -251,7 +333,7 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
         return false;
     }
 
-    const uint16_t sequence = static_cast<uint16_t>(packet_id);
+    ++impl_->next_transport_sequence;
     const uint64_t generation = impl_->next_send_generation;
     if (impl_->next_send_generation <
         std::numeric_limits<uint64_t>::max()) {
@@ -266,7 +348,8 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
         std::min<uint64_t>(packet.bytes.size(), room);
     const SentPacketInfo info{
         sequence, packet.bytes.size(), send_time_us, packet.probe,
-        impl_->cumulative_sent_bytes, generation, history_ordinal};
+        impl_->cumulative_sent_bytes, generation, history_ordinal,
+        impl_->active_probe_epoch != 0U};
     impl_->history.push_back(
         {sequence, generation, impl_->cumulative_sent_bytes,
          history_ordinal});
@@ -284,6 +367,158 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
     out = info;
     ++impl_->sent_count;
     return true;
+}
+
+void TransportSender::SetPacingRate(uint32_t bitrate_kbps) {
+    impl_->pacing_rate_kbps = bitrate_kbps;
+}
+
+bool TransportSender::SchedulePaced(uint32_t packet_id) {
+    const auto cancelled = impl_->cancelled_ids.find(packet_id);
+    if (cancelled != impl_->cancelled_ids.end()) {
+        impl_->cancelled_ids.erase(cancelled);
+        impl_->vendor_callback_pending.erase(packet_id);
+        return true;
+    }
+    const auto vendor_pending =
+        impl_->vendor_callback_pending.find(packet_id);
+    if (vendor_pending != impl_->vendor_callback_pending.end()) {
+        impl_->vendor_callback_pending.erase(vendor_pending);
+        if (impl_->paced.find(packet_id) == impl_->paced.end() ||
+            impl_->scheduled_ids.find(packet_id) !=
+                impl_->scheduled_ids.end()) {
+            return true;
+        }
+    }
+    const auto found = impl_->paced.find(packet_id);
+    if (found == impl_->paced.end()) {
+        return false;
+    }
+    if (impl_->scheduled_ids.find(packet_id) !=
+        impl_->scheduled_ids.end()) {
+        return true;
+    }
+    uint64_t now_us = 0U;
+    try {
+        if (!impl_->clock) {
+            return false;
+        }
+        now_us = impl_->clock();
+    } catch (...) {
+        return false;
+    }
+    if (found->second.probe &&
+        impl_->active_probe_epoch != 0U) {
+        impl_->scheduled_probe.push_back({packet_id, now_us});
+    } else {
+        impl_->scheduled_media.push_back({packet_id, now_us});
+    }
+    impl_->scheduled_ids.insert(packet_id);
+    return true;
+}
+
+size_t TransportSender::FlushPaced(const SentFunction& on_sent) {
+    if (impl_->pacing_rate_kbps == 0U || !impl_->clock) {
+        return 0U;
+    }
+    uint64_t now_us = 0U;
+    try {
+        now_us = impl_->clock();
+    } catch (...) {
+        return 0U;
+    }
+
+    size_t sent_count = 0U;
+    while (!impl_->scheduled_probe.empty() ||
+           !impl_->scheduled_media.empty()) {
+        // Media sent during an active epoch is itself probe-cluster traffic.
+        // Keep ready media ahead of synthetic padding; padding only fills
+        // aggregate probe-rate deficits when no media packet is ready.
+        std::deque<Impl::ScheduledPacket>* queue =
+            !impl_->scheduled_media.empty()
+                ? &impl_->scheduled_media
+                : &impl_->scheduled_probe;
+        const uint32_t packet_id =
+            queue->front().packet_id;
+        const auto found = impl_->paced.find(packet_id);
+        if (found == impl_->paced.end()) {
+            queue->pop_front();
+            impl_->scheduled_ids.erase(packet_id);
+            continue;
+        }
+        if (impl_->next_send_time_us != 0U &&
+            now_us < impl_->next_send_time_us) {
+            break;
+        }
+
+        queue->pop_front();
+        impl_->scheduled_ids.erase(packet_id);
+        SentPacket sent;
+        if (!SendPaced(packet_id, sent)) {
+            continue;
+        }
+        ++sent_count;
+        if (on_sent) {
+            try {
+                on_sent(sent);
+            } catch (...) {
+                // Sending is already complete; callbacks cannot roll it back.
+            }
+        }
+
+        constexpr uint64_t kMicrosPerByteAtOneKbps = 8000U;
+        const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+        const uint64_t numerator =
+            sent.size > maximum / kMicrosPerByteAtOneKbps
+                ? maximum
+                : static_cast<uint64_t>(sent.size) *
+                      kMicrosPerByteAtOneKbps;
+        const uint64_t interval_us =
+            numerator / impl_->pacing_rate_kbps +
+            (numerator % impl_->pacing_rate_kbps != 0U ? 1U : 0U);
+        const uint64_t base =
+            impl_->next_send_time_us == 0U ||
+                    sent.send_time_us > impl_->next_send_time_us
+                ? sent.send_time_us
+                : impl_->next_send_time_us;
+        impl_->next_send_time_us =
+            interval_us > maximum - base ? maximum : base + interval_us;
+    }
+    return sent_count;
+}
+
+uint32_t TransportSender::PacingQueueDelayMs() {
+    if (!impl_->clock) {
+        return 0U;
+    }
+    uint64_t now_us = 0U;
+    try {
+        now_us = impl_->clock();
+    } catch (...) {
+        return 0U;
+    }
+    const auto delay_for =
+        [&](const std::deque<Impl::ScheduledPacket>& queue) {
+            for (const Impl::ScheduledPacket& scheduled : queue) {
+                if (impl_->paced.find(scheduled.packet_id) ==
+                    impl_->paced.end()) {
+                    continue;
+                }
+                if (now_us <= scheduled.scheduled_time_us) {
+                    return uint32_t{0};
+                }
+                const uint64_t delay_ms =
+                    (now_us - scheduled.scheduled_time_us) / 1000U;
+                return delay_ms >
+                               std::numeric_limits<uint32_t>::max()
+                           ? std::numeric_limits<uint32_t>::max()
+                           : static_cast<uint32_t>(delay_ms);
+            }
+            return uint32_t{0};
+        };
+    const uint32_t probe_delay = delay_for(impl_->scheduled_probe);
+    const uint32_t media_delay = delay_for(impl_->scheduled_media);
+    return std::max(probe_delay, media_delay);
 }
 
 bool TransportSender::LookupSendTime(

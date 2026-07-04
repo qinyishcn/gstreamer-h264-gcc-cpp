@@ -14,6 +14,12 @@ constexpr uint32_t kMinimumRecoveryWaitMs = 50;
 
 }  // namespace
 
+bool ShouldApplyRawRateEvent(
+    uint32_t proposed_kbps, uint32_t current_kbps,
+    bool delay_overusing) noexcept {
+    return proposed_kbps < current_kbps || !delay_overusing;
+}
+
 RatePolicy::RatePolicy(
     uint32_t min_kbps, uint32_t max_kbps, double media_utilization)
     : min_kbps_(min_kbps),
@@ -23,7 +29,8 @@ RatePolicy::RatePolicy(
       growth_cap_kbps_(min_kbps),
       last_apply_ms_(0),
       last_major_decrease_ms_(0),
-      has_major_decrease_(false) {
+      has_major_decrease_(false),
+      delay_decrease_latched_(false) {
     if (min_kbps_ > max_kbps_) {
         std::swap(min_kbps_, max_kbps_);
     }
@@ -42,6 +49,7 @@ void RatePolicy::Reset(uint32_t network_kbps, uint64_t now_ms) {
     last_apply_ms_ = now_ms;
     last_major_decrease_ms_ = 0;
     has_major_decrease_ = false;
+    delay_decrease_latched_ = false;
 }
 
 RateDecision RatePolicy::Apply(const RateInput& input) {
@@ -52,7 +60,22 @@ RateDecision RatePolicy::Apply(const RateInput& input) {
     const uint64_t elapsed_ms = event_now_ms - last_apply_ms_;
 
     switch (input.reason) {
-        case RateReason::DelayOveruse:
+        case RateReason::DelayOveruse: {
+            if (proposal < network_kbps_ &&
+                !delay_decrease_latched_) {
+                const uint32_t half_floor =
+                    network_kbps_ / 2 + network_kbps_ % 2;
+                network_kbps_ = Clamp(std::max(proposal, half_floor));
+                if (network_kbps_ < previous) {
+                    growth_cap_kbps_ = network_kbps_;
+                    last_major_decrease_ms_ = event_now_ms;
+                    has_major_decrease_ = true;
+                    delay_decrease_latched_ = true;
+                }
+            }
+            break;
+        }
+
         case RateReason::Loss:
             if (proposal < network_kbps_) {
                 const uint32_t half_floor =
@@ -74,6 +97,10 @@ RateDecision RatePolicy::Apply(const RateInput& input) {
             break;
 
         case RateReason::Normal:
+            // A non-decreasing estimator result marks the end of the
+            // current delay-overuse episode. The next distinct episode may
+            // therefore reduce immediately, independent of wall-clock time.
+            delay_decrease_latched_ = false;
             if (proposal > network_kbps_) {
                 const uint64_t recovery_wait_ms =
                     std::max<uint64_t>(

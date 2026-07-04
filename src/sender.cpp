@@ -41,7 +41,7 @@ constexpr uint32_t kMinBitrateKbps = 200U;
 constexpr uint32_t kMaxBitrateKbps = 8000U;
 constexpr uint32_t kMaxNormalPacingKbps = 9600U;
 constexpr size_t kIngressLimitBytes = 4U * 1024U * 1024U;
-constexpr size_t kMaxProbePacketBytes = 267U;
+constexpr size_t kMaxProbePacketBytes = 1200U;
 constexpr size_t kMinProbePacketBytes = 17U;
 constexpr size_t kMaxControlEventsPerPump = 100000U;
 constexpr size_t kMaxFeedbackPerLoop = 64U;
@@ -212,6 +212,7 @@ struct RawRateEvent {
     uint32_t rtt_ms;
     uint64_t now_ms;
     bool probe_related;
+    bool delay_overusing;
 };
 
 GstFlowReturn OnNewSample(GstAppSink* sink, gpointer user_data) {
@@ -363,6 +364,9 @@ int main(int argc, char* argv[]) {
     gcc::OuterLossBackoff outer_loss_backoff(kMinBitrateKbps);
     gcc::ProbeAction deferred_probe_action;
     uint64_t probe_bytes_enqueued = 0U;
+    uint64_t probe_bytes_sent = 0U;
+    uint64_t probe_sent_baseline = 0U;
+    uint64_t probe_epoch = 0U;
 
     std::deque<RawRateEvent> pending_rate_events;
     std::deque<gcc::SentPacket> deferred_sent_packets;
@@ -373,8 +377,10 @@ int main(int argc, char* argv[]) {
     std::array<uint64_t, 65536> consumed_rtt_send_times{};
     uint64_t media_sent = 0U;
     uint64_t probe_sent = 0U;
+    uint64_t probe_cluster_sent = 0U;
     uint64_t feedback_count = 0U;
     uint64_t applied_loss_decisions = 0U;
+    uint32_t validated_probe_kbps = 0U;
 
     const auto advance_probe_send_progress = [&]() {
         gcc::SentHistoryWatermark watermark;
@@ -383,6 +389,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    razor::Sender* razor_sender_view = nullptr;
     razor::Sender razor_sender(
         [&](uint32_t proposed_kbps, uint8_t callback_loss,
             uint32_t callback_rtt_ms) {
@@ -392,24 +399,21 @@ int main(int argc, char* argv[]) {
                     {proposed_kbps, callback_loss, callback_rtt_ms,
                      SteadyMillis(),
                      scoped_probe_feedback ||
-                         probe_delivery.rate_events_guarded()});
+                         probe_delivery.rate_events_guarded(),
+                     razor_sender_view != nullptr &&
+                         razor_sender_view->stats().delay_state == 2});
             } catch (...) {
                 control_queue_failed = true;
                 running.store(false);
             }
         },
         [&](uint32_t packet_id, int, size_t, bool) {
-            gcc::SentPacket sent;
-            if (!transport.SendPaced(packet_id, sent)) {
-                return;
-            }
-            try {
-                deferred_sent_packets.push_back(sent);
-            } catch (...) {
+            if (!transport.SchedulePaced(packet_id)) {
                 control_queue_failed = true;
                 running.store(false);
             }
         });
+    razor_sender_view = &razor_sender;
     if (!razor_sender.is_valid()) {
         std::fprintf(stderr, "ERROR: Failed to create razor sender\n");
         return EXIT_FAILURE;
@@ -417,6 +421,7 @@ int main(int argc, char* argv[]) {
     razor_sender.set_bitrates(
         kMinBitrateKbps, current_network_kbps, kMaxBitrateKbps);
     razor_sender.set_pacing_rate(current_pacing_kbps);
+    transport.SetPacingRate(current_pacing_kbps);
 
     gcc::FeedbackChannel feedback(
         "0.0.0.0", feedback_port, true);
@@ -539,6 +544,7 @@ int main(int argc, char* argv[]) {
             std::max(kMinBitrateKbps,
                      std::min(kbps, kMaxNormalPacingKbps));
         razor_sender.set_pacing_rate(current_pacing_kbps);
+        transport.SetPacingRate(current_pacing_kbps);
     };
     gcc::ProbeState reported_probe_state = probe_controller.state();
     bool has_reported_rate = false;
@@ -604,13 +610,17 @@ int main(int argc, char* argv[]) {
                     sent.transport_sequence, sent.size);
                 if (sent.probe) {
                     ++probe_sent;
+                    probe_bytes_sent += sent.size;
+                } else {
+                    ++media_sent;
+                }
+                if (sent.probe_cluster) {
+                    ++probe_cluster_sent;
                     probe_delivery.OnProbePacketSent(sent);
                     MergeProbeAction(
                         deferred_probe_action,
                         probe_controller.OnProbePacketSent(
                             sent.size, sent.send_time_us / 1000U));
-                } else {
-                    ++media_sent;
                 }
                 continue;
             }
@@ -619,6 +629,11 @@ int main(int argc, char* argv[]) {
             const RawRateEvent event = pending_rate_events.front();
             pending_rate_events.pop_front();
             if (event.probe_related) {
+                continue;
+            }
+            if (!gcc::ShouldApplyRawRateEvent(
+                    event.proposed_kbps, current_network_kbps,
+                    event.delay_overusing)) {
                 continue;
             }
             const gcc::RateReason reason =
@@ -638,12 +653,25 @@ int main(int argc, char* argv[]) {
         }
         return true;
     };
+    const auto flush_transport = [&]() {
+        transport.FlushPaced(
+            [&](const gcc::SentPacket& sent) {
+                try {
+                    deferred_sent_packets.push_back(sent);
+                } catch (...) {
+                    control_queue_failed = true;
+                    running.store(false);
+                }
+            });
+    };
     const auto handle_probe_action =
         [&](const gcc::ProbeAction& action) {
             if (action.stop) {
+                transport.CancelProbeEpoch(probe_epoch);
                 set_pacing(NormalPacingRate(current_network_kbps));
             }
             if (action.accept) {
+                validated_probe_kbps = action.accepted_kbps;
                 probe_delivery.Finish();
                 apply_rate_decision(
                     rate_policy.Apply(
@@ -657,10 +685,18 @@ int main(int argc, char* argv[]) {
             }
             if (action.start) {
                 probe_bytes_enqueued = 0U;
+                probe_bytes_sent = 0U;
+                probe_epoch = transport.BeginProbeEpoch();
+                gcc::SentHistoryWatermark watermark;
+                probe_sent_baseline =
+                    transport.GetSentHistoryWatermark(watermark)
+                        ? watermark.cumulative_sent_bytes
+                        : 0U;
                 probe_delivery.Start(action.probe_kbps);
                 set_pacing(action.probe_kbps);
             }
             if (probe_controller.state() == gcc::ProbeState::Failed) {
+                transport.CancelProbeEpoch(probe_epoch);
                 probe_delivery.Finish();
                 set_pacing(NormalPacingRate(current_network_kbps));
             }
@@ -686,19 +722,30 @@ int main(int argc, char* argv[]) {
     };
     const auto print_stats = [&]() {
         const razor::SenderStats stats = razor_sender.stats();
+        gcc::SentHistoryWatermark watermark;
+        const uint64_t wire_bytes =
+            transport.GetSentHistoryWatermark(watermark)
+                ? watermark.cumulative_sent_bytes
+                : 0U;
         std::printf(
             "gcc_stats encoder_kbps=%u target_kbps=%u pacing_kbps=%u "
-            "acked_kbps=%u probe_delivery_kbps=%u loss_q8=%u "
+            "acked_kbps=%u probe_delivery_kbps=%u "
+            "validated_probe_kbps=%u loss_q8=%u "
             "rtt_ms=%u delay_state=%d "
-            "media_sent=%llu probe_sent=%llu feedback=%llu "
+            "media_sent=%llu probe_sent=%llu probe_cluster_sent=%llu "
+            "wire_bytes=%llu "
+            "feedback=%llu "
             "feedback_matched=%llu pacer_queue_ms=%lld "
             "ingress_bytes=%zu probe_state=%s\n",
             current_encoder_kbps, current_network_kbps,
             current_pacing_kbps, stats.acked_bitrate_kbps,
             probe_delivery.estimate_kbps(),
+            validated_probe_kbps,
             static_cast<unsigned>(loss_q8), rtt_ms, stats.delay_state,
             static_cast<unsigned long long>(media_sent),
             static_cast<unsigned long long>(probe_sent),
+            static_cast<unsigned long long>(probe_cluster_sent),
+            static_cast<unsigned long long>(wire_bytes),
             static_cast<unsigned long long>(feedback_count),
             static_cast<unsigned long long>(
                 stats.matched_feedback_packets),
@@ -800,12 +847,16 @@ int main(int argc, char* argv[]) {
                 process_control_events();
             }
             scoped_probe_feedback = false;
+            // A razor loss decision suppresses duplicate fallback for this
+            // feedback, but does not consume the fallback episode. If razor
+            // stops decreasing while outer loss remains high, the next
+            // eligible feedback can still trigger one emergency half-step.
             const gcc::OuterLossDecision outer_loss =
                 outer_loss_backoff.Evaluate(
                     loss_q8, current_network_kbps, rtt_ms, now_ms,
-                    !probe_related_batch);
-            if (outer_loss.changed &&
-                applied_loss_decisions == loss_decisions_before) {
+                    !probe_related_batch,
+                    applied_loss_decisions != loss_decisions_before);
+            if (outer_loss.changed) {
                 const gcc::RateDecision decision =
                     rate_policy.Apply(
                         {gcc::RateReason::Loss,
@@ -829,6 +880,15 @@ int main(int argc, char* argv[]) {
         }
 
         MergeProbeAction(
+            deferred_probe_action,
+            probe_controller.OnPacerQueueDelay(
+                std::max(
+                    transport.PacingQueueDelayMs(),
+                    static_cast<uint32_t>(std::min<int64_t>(
+                        razor_sender.pacer_queue_ms(),
+                        std::numeric_limits<uint32_t>::max()))),
+                now_ms));
+        MergeProbeAction(
             deferred_probe_action, probe_controller.OnTimer(now_ms));
         process_control_events();
 
@@ -847,21 +907,32 @@ int main(int argc, char* argv[]) {
                 probe_controller.active_probe_kbps(),
                 probe_controller.probe_start_ms(), now_ms,
                 probe_config.duration_ms);
-            while (probe_bytes_enqueued < desired_bytes) {
-                const uint64_t deficit =
-                    desired_bytes - probe_bytes_enqueued;
-                if (deficit < kMinProbePacketBytes) {
-                    break;
-                }
+            gcc::SentHistoryWatermark watermark;
+            const uint64_t aggregate_sent =
+                transport.GetSentHistoryWatermark(watermark) &&
+                        watermark.cumulative_sent_bytes >=
+                            probe_sent_baseline
+                    ? watermark.cumulative_sent_bytes -
+                          probe_sent_baseline
+                    : 0U;
+            const uint64_t queued_probe =
+                probe_bytes_enqueued >= probe_bytes_sent
+                    ? probe_bytes_enqueued - probe_bytes_sent
+                    : 0U;
+            uint64_t deficit = gcc::ProbePaddingDeficitBytes(
+                desired_bytes, aggregate_sent, queued_probe);
+            while (deficit >= kMinProbePacketBytes) {
                 const size_t packet_size = static_cast<size_t>(
                     std::min<uint64_t>(deficit, kMaxProbePacketBytes));
                 std::vector<uint8_t> probe = gcc::BuildProbeRtpPacket(
                     latest_media_header, 0U, packet_size);
                 if (probe.empty() ||
-                    !transport.EnqueueProbe(std::move(probe))) {
+                    !transport.EnqueueProbe(
+                        std::move(probe), probe_epoch)) {
                     break;
                 }
                 probe_bytes_enqueued += packet_size;
+                deficit -= packet_size;
             }
         }
 
@@ -872,12 +943,14 @@ int main(int argc, char* argv[]) {
                 process_control_events();
                 return accepted;
             });
+        flush_transport();
         process_control_events();
 
         const uint64_t heartbeat_now_us = SteadyMicros();
         if (heartbeat_now_us - last_heartbeat_us >= 5000U) {
             advance_probe_send_progress();
             razor_sender.heartbeat();
+            flush_transport();
             process_control_events();
             last_heartbeat_us = heartbeat_now_us;
         }
@@ -886,7 +959,7 @@ int main(int argc, char* argv[]) {
             print_stats();
             last_stats_us = now_us;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     // Stop production before draining every packet already accepted by the
@@ -913,6 +986,7 @@ int main(int argc, char* argv[]) {
     while (!control_queue_failed) {
         advance_probe_send_progress();
         razor_sender.heartbeat();
+        flush_transport();
         process_control_events();
         if (transport.ingress_bytes() == 0U &&
             transport.pending_packets() == 0U &&

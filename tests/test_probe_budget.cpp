@@ -20,5 +20,11 @@ int main() {
     CHECK_TRUE(gcc::ProbeBudgetBytes(maximum, 0U, maximum, maximum) ==
                maximum);
     CHECK_TRUE(gcc::ProbeBudgetBytes(maximum, maximum, 0U, maximum) == 0U);
+    CHECK_TRUE(gcc::ProbePaddingDeficitBytes(
+                   50000U, 20000U, 10000U) == 20000U);
+    CHECK_TRUE(gcc::ProbePaddingDeficitBytes(
+                   50000U, 45000U, 10000U) == 0U);
+    CHECK_TRUE(gcc::ProbePaddingDeficitBytes(
+                   maximum, maximum - 10U, 20U) == 0U);
     return 0;
 }

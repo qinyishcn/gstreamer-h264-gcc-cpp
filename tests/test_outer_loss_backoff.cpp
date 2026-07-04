@@ -4,6 +4,17 @@
 #include <cstdint>
 
 int main() {
+    gcc::OuterLossBackoff razor_then_fallback(200U);
+    CHECK_TRUE(!razor_then_fallback.Evaluate(
+        80U, 4000U, 50U, 100U, true, true).changed);
+    gcc::OuterLossDecision after_razor =
+        razor_then_fallback.Evaluate(
+            80U, 3600U, 50U, 101U, true, false);
+    CHECK_TRUE(after_razor.changed);
+    CHECK_EQ(after_razor.proposed_kbps, static_cast<uint32_t>(1800));
+    CHECK_TRUE(!razor_then_fallback.Evaluate(
+        80U, 1800U, 50U, 102U, true, false).changed);
+
     gcc::OuterLossBackoff backoff(200U);
     gcc::OuterLossDecision decision =
         backoff.Evaluate(26U, 4001U, 100U, 1000U, true);
@@ -12,19 +23,21 @@ int main() {
 
     CHECK_TRUE(!backoff.Evaluate(
         26U, 2001U, 100U, 1249U, true).changed);
-    decision = backoff.Evaluate(26U, 2001U, 100U, 1250U, true);
+    CHECK_TRUE(!backoff.Evaluate(
+        26U, 2001U, 100U, 1250U, true).changed);
+
+    CHECK_TRUE(!backoff.Evaluate(
+        25U, 2001U, 500U, 1500U, false).changed);
+    CHECK_TRUE(!backoff.Evaluate(
+        26U, 2001U, 500U, 1500U, true).changed);
+    CHECK_TRUE(!backoff.Evaluate(
+        25U, 2001U, 500U, 1750U, true).changed);
+    decision = backoff.Evaluate(26U, 2001U, 500U, 1751U, true);
     CHECK_TRUE(decision.changed);
     CHECK_EQ(decision.proposed_kbps, static_cast<uint32_t>(1001));
 
     CHECK_TRUE(!backoff.Evaluate(
-        26U, 1001U, 500U, 1500U, false).changed);
-    CHECK_TRUE(!backoff.Evaluate(
-        26U, 1001U, 500U, 1500U, true).changed);
-    decision = backoff.Evaluate(26U, 1001U, 500U, 1750U, true);
-    CHECK_TRUE(decision.changed);
-
-    CHECK_TRUE(!backoff.Evaluate(
-        25U, 500U, 0U, 1800U, true).changed);
+        25U, 1001U, 0U, 1800U, true).changed);
     CHECK_TRUE(backoff.Evaluate(
         26U, 500U, 0U, 1801U, true).changed);
     CHECK_TRUE(!backoff.Evaluate(

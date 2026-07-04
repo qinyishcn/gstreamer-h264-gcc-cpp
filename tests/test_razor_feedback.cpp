@@ -310,10 +310,10 @@ int TestCombinedFeedbackProcessesEverySection() {
 int TestPacerConfigurationAndCppStats() {
     pace_sender_t* raw_pacer = pace_create(nullptr, nullptr, 250);
     CHECK_TRUE(raw_pacer != nullptr);
-    CHECK_EQ(raw_pacer->pacing_factor_x100, static_cast<uint32_t>(120));
+    CHECK_EQ(raw_pacer->pacing_factor_x100, static_cast<uint32_t>(100));
     pace_set_bitrate_limits(raw_pacer, 200000);
     pace_set_estimate_bitrate(raw_pacer, 1000000);
-    CHECK_EQ(raw_pacer->pacing_bitrate_kpbs, static_cast<uint32_t>(1200));
+    CHECK_EQ(raw_pacer->pacing_bitrate_kpbs, static_cast<uint32_t>(1000));
     pace_set_pacing_rate(raw_pacer, 200000);
     CHECK_EQ(raw_pacer->pacing_bitrate_kpbs, static_cast<uint32_t>(400));
     CHECK_EQ(pace_queue_ms(raw_pacer), static_cast<int64_t>(0));

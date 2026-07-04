@@ -214,10 +214,12 @@ int TestProbePacket() {
         minimum_packet.data(), minimum_packet.size()));
 
     const std::vector<uint8_t> maximum_packet =
-        gcc::BuildProbeRtpPacket(source, 1, 267);
-    CHECK_EQ(maximum_packet.size(), static_cast<size_t>(267));
+        gcc::BuildProbeRtpPacket(source, 1, 1200);
+    CHECK_EQ(maximum_packet.size(), static_cast<size_t>(1200));
     CHECK_TRUE(gcc::IsProbeRtpPacket(
         maximum_packet.data(), maximum_packet.size()));
+    CHECK_EQ(maximum_packet.back(), static_cast<uint8_t>(255));
+    CHECK_EQ(maximum_packet[945], static_cast<uint8_t>('G'));
 
     std::vector<uint8_t> payload_then_padding = packet;
     payload_then_padding.back() = 1;
@@ -225,7 +227,7 @@ int TestProbePacket() {
         payload_then_padding.data(), payload_then_padding.size()));
 
     CHECK_TRUE(gcc::BuildProbeRtpPacket(source, 1, 16).empty());
-    CHECK_TRUE(gcc::BuildProbeRtpPacket(source, 1, 268).empty());
+    CHECK_TRUE(gcc::BuildProbeRtpPacket(source, 1, 1201).empty());
     return EXIT_SUCCESS;
 }
 

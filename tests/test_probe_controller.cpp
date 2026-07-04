@@ -366,6 +366,18 @@ int TestByteCountingSaturatesAndIgnoresInactive() {
     return EXIT_SUCCESS;
 }
 
+int TestExcessivePacerQueueAbortsActiveProbe() {
+    ProbeController controller;
+    CHECK_TRUE(controller.OnStableTarget(1000U, 0U).start);
+    CHECK_TRUE(!controller.OnPacerQueueDelay(250U, 1U).stop);
+    const ProbeAction aborted =
+        controller.OnPacerQueueDelay(251U, 2U);
+    CHECK_TRUE(aborted.stop);
+    CHECK_EQ(controller.state(), ProbeState::Failed);
+    CHECK_TRUE(!controller.OnPacerQueueDelay(1000U, 3U).stop);
+    return EXIT_SUCCESS;
+}
+
 int TestInvalidConfigurationAndNumericLimits() {
     ProbeConfig invalid;
     invalid.first_scale = std::numeric_limits<double>::infinity();
@@ -421,6 +433,7 @@ int main() {
     CHECK_EQ(TestIgnoredEventsDoNotAdvanceTime(), EXIT_SUCCESS);
     CHECK_EQ(TestTimeRollbackIsSafe(), EXIT_SUCCESS);
     CHECK_EQ(TestByteCountingSaturatesAndIgnoresInactive(), EXIT_SUCCESS);
+    CHECK_EQ(TestExcessivePacerQueueAbortsActiveProbe(), EXIT_SUCCESS);
     CHECK_EQ(TestInvalidConfigurationAndNumericLimits(), EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

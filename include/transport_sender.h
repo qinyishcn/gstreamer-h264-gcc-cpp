@@ -24,6 +24,7 @@ struct SentPacket {
     uint64_t cumulative_sent_bytes = 0U;
     uint64_t generation = 0U;
     uint32_t history_ordinal = 0U;
+    bool probe_cluster = false;
 };
 using SentPacketInfo = SentPacket;
 
@@ -42,6 +43,7 @@ public:
     using SendFunction = std::function<bool(const uint8_t*, size_t)>;
     using ClockFunction = std::function<uint64_t()>;
     using PacerAddFunction = std::function<bool(uint32_t, size_t)>;
+    using SentFunction = std::function<void(const SentPacket&)>;
 
     TransportSender(
         SendFunction send, ClockFunction clock, size_t max_ingress_bytes);
@@ -65,16 +67,28 @@ public:
     // EnqueueMedia and EnqueueProbe are the producer-thread API.
     bool EnqueueMedia(std::vector<uint8_t> packet);
     bool EnqueueProbe(std::vector<uint8_t> packet);
+    bool EnqueueProbe(std::vector<uint8_t> packet, uint64_t probe_epoch);
+    uint64_t BeginProbeEpoch();
+    size_t CancelProbeEpoch(uint64_t probe_epoch);
 
     // All methods below except the atomic/mutex-backed metric getters are
     // control-thread-only. Pacer callbacks must return on the calling thread.
-    // Packet IDs advance modulo uint32_t; their low 16 bits are RTP sequence.
+    // Packet IDs advance modulo uint32_t and identify pacer entries only.
+    // Successful UDP sends receive an independent contiguous RTP sequence.
     // Every pacer-accepted ID must eventually be passed to SendPaced (or be
-    // cancelled by a future explicit cancellation API). TransportSender does
-    // not independently age-evict paced entries because doing so would
-    // desynchronize its packet map from the razor pacer queue.
+    // cancelled by CancelProbeEpoch). TransportSender does not independently
+    // age-evict media entries because doing so would desynchronize its packet
+    // map from the razor pacer queue.
     size_t DrainIngress(const PacerAddFunction& add);
     bool SendPaced(uint32_t packet_id, SentPacket& out);
+    // Razor may request an aged queue in a burst. SchedulePaced records those
+    // requests, while FlushPaced applies the application's strict aggregate
+    // wire-rate ceiling. One packet may be sent immediately after an idle
+    // period; subsequent packets are serialized at the configured rate.
+    void SetPacingRate(uint32_t bitrate_kbps);
+    bool SchedulePaced(uint32_t packet_id);
+    size_t FlushPaced(const SentFunction& on_sent);
+    uint32_t PacingQueueDelayMs();
     bool LookupSentPacket(uint16_t sequence, SentPacketInfo& out) const;
     bool GetSentHistoryWatermark(SentHistoryWatermark& out) const;
     bool LookupSendTime(uint16_t sequence, uint64_t& out_us) const;

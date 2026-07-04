@@ -24,6 +24,10 @@ struct RateDecision {
     uint32_t encoder_kbps;
 };
 
+bool ShouldApplyRawRateEvent(
+    uint32_t proposed_kbps, uint32_t current_kbps,
+    bool delay_overusing) noexcept;
+
 class RatePolicy {
 public:
     RatePolicy(
@@ -46,6 +50,7 @@ private:
     uint64_t last_apply_ms_;
     uint64_t last_major_decrease_ms_;
     bool has_major_decrease_;
+    bool delay_decrease_latched_;
 };
 
 }  // namespace gcc

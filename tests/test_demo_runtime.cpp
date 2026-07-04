@@ -220,7 +220,8 @@ int main(int argc, char* argv[]) {
     Require(fields, "loss_q8");
     Require(fields, "rtt_ms");
     CHECK_TRUE(Require(fields, "media_sent") > 100U);
-    CHECK_TRUE(Require(fields, "probe_sent") > 0U);
+    Require(fields, "probe_sent");
+    CHECK_TRUE(Require(fields, "probe_cluster_sent") > 0U);
     CHECK_TRUE(Require(fields, "feedback") > 50U);
     CHECK_TRUE(Require(fields, "feedback_matched") > 50U);
     CHECK_TRUE(Require(fields, "frames") > 0U);

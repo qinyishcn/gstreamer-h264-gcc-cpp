@@ -13,6 +13,15 @@ using gcc::RateInput;
 using gcc::RatePolicy;
 using gcc::RateReason;
 
+int TestOveruseProposalCannotRearmDelayEpisode() {
+    CHECK_TRUE(!gcc::ShouldApplyRawRateEvent(6000U, 6000U, true));
+    CHECK_TRUE(!gcc::ShouldApplyRawRateEvent(7000U, 6000U, true));
+    CHECK_TRUE(gcc::ShouldApplyRawRateEvent(3000U, 6000U, true));
+    CHECK_TRUE(gcc::ShouldApplyRawRateEvent(6000U, 6000U, false));
+    CHECK_TRUE(gcc::ShouldApplyRawRateEvent(7000U, 6000U, false));
+    return EXIT_SUCCESS;
+}
+
 RateDecision Apply(
     RatePolicy& policy, RateReason reason, uint32_t proposal,
     uint32_t rtt_ms, uint64_t now_ms) {
@@ -152,6 +161,36 @@ int TestCongestionCanDecreaseRepeatedlyButNeverIncrease() {
         Apply(policy, RateReason::Loss, 5000, 0, 3);
     CHECK_TRUE(!decision.changed);
     CHECK_EQ(decision.network_kbps, static_cast<uint32_t>(1000));
+    return EXIT_SUCCESS;
+}
+
+int TestDelayOveruseRequiresNormalSignalToRearm() {
+    RatePolicy policy(100, 10000);
+    policy.Reset(8000, 0);
+    CHECK_EQ(
+        Apply(policy, RateReason::DelayOveruse, 6000, 40, 100)
+            .network_kbps,
+        static_cast<uint32_t>(6000));
+    CHECK_EQ(
+        Apply(policy, RateReason::DelayOveruse, 3000, 40, 101)
+            .network_kbps,
+        static_cast<uint32_t>(6000));
+    CHECK_EQ(
+        Apply(policy, RateReason::DelayOveruse, 3000, 40, 1099)
+            .network_kbps,
+        static_cast<uint32_t>(6000));
+    CHECK_EQ(
+        Apply(policy, RateReason::DelayOveruse, 3000, 40, 1100)
+            .network_kbps,
+        static_cast<uint32_t>(6000));
+    CHECK_EQ(
+        Apply(policy, RateReason::Normal, 6000, 40, 1101)
+            .network_kbps,
+        static_cast<uint32_t>(6000));
+    CHECK_EQ(
+        Apply(policy, RateReason::DelayOveruse, 3000, 40, 1102)
+            .network_kbps,
+        static_cast<uint32_t>(3000));
     return EXIT_SUCCESS;
 }
 
@@ -314,6 +353,7 @@ int TestResetClearsRecoveryStateAndChangedIsExact() {
 }  // namespace
 
 int main() {
+    CHECK_EQ(TestOveruseProposalCannotRearmDelayEpisode(), EXIT_SUCCESS);
     CHECK_EQ(TestCoreSequence(), EXIT_SUCCESS);
     CHECK_EQ(TestBoundsAndNormalizedRange(), EXIT_SUCCESS);
     CHECK_EQ(TestNormalGrowthLimit(), EXIT_SUCCESS);
@@ -322,6 +362,8 @@ int main() {
     CHECK_EQ(TestProposalLimitDoesNotStoreHiddenGrowth(), EXIT_SUCCESS);
     CHECK_EQ(TestRecoveryWaitsForRtt(), EXIT_SUCCESS);
     CHECK_EQ(TestCongestionCanDecreaseRepeatedlyButNeverIncrease(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestDelayOveruseRequiresNormalSignalToRearm(),
              EXIT_SUCCESS);
     CHECK_EQ(TestProbeOnlyIncreases(), EXIT_SUCCESS);
     CHECK_EQ(TestBackwardTimeHoldsNormalGrowth(), EXIT_SUCCESS);

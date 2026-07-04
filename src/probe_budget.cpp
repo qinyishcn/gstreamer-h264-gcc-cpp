@@ -42,4 +42,17 @@ uint64_t ProbeBudgetBytes(uint64_t probe_kbps,
         whole, SaturatingAdd(remainder_whole, remainder_tail));
 }
 
+uint64_t ProbePaddingDeficitBytes(uint64_t desired_aggregate_bytes,
+                                  uint64_t aggregate_sent_bytes,
+                                  uint64_t queued_padding_bytes) noexcept {
+    if (aggregate_sent_bytes >= desired_aggregate_bytes) {
+        return 0U;
+    }
+    const uint64_t remaining =
+        desired_aggregate_bytes - aggregate_sent_bytes;
+    return queued_padding_bytes >= remaining
+               ? 0U
+               : remaining - queued_padding_bytes;
+}
+
 }  // namespace gcc
