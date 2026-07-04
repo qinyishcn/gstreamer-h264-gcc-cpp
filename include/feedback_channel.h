@@ -3,14 +3,14 @@
  * Feedback Channel for GCC Video Transmission
  *
  * UDP-based feedback channel carrying razor library feedback data.
- * Protocol v2: variable-length razor payload.
- *
- * FeedbackPacket layout (header 10 bytes + up to 256 bytes payload):
- *   magic(1) + version(1) + seq(2) + loss_pct_x100(1) + fb_size(2) + reserved(3) + fb_data(N)
+ * Protocol v4: portable, explicitly encoded header plus razor payload.
  */
+
+#include "feedback_packet.h"
 
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <atomic>
@@ -18,42 +18,38 @@
 #include <mutex>
 #include <deque>
 #include <chrono>
+#include <cstdio>
+#include <limits>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
   typedef int socklen_t;
   #define CLOSE_SOCKET closesocket
+  using FeedbackSocket = SOCKET;
+  static constexpr FeedbackSocket kInvalidFeedbackSocket = INVALID_SOCKET;
 #else
   #include <sys/socket.h>
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
   #define CLOSE_SOCKET close
+  using FeedbackSocket = int;
+  static constexpr FeedbackSocket kInvalidFeedbackSocket = -1;
 #endif
 
 namespace gcc {
 
-// ── Feedback Packet Protocol v3 ────────────────────────────────────
-//  Header: 18 bytes fixed (adds RTT estimation timestamps)
-//  Payload: variable-length razor feedback (0-256 bytes)
-
-#pragma pack(push, 1)
-struct FeedbackHeader {
-    uint8_t  magic;           // 0xCC
-    uint8_t  version;         // 3 = razor + RTT
-    uint16_t seq;             // latest RTP seq
-    uint8_t  loss_pct_x100;   // loss % * 100
-    uint16_t fb_size;         // razor feedback data size
-    uint32_t rx_ts_ms;        // receiver: when packet was received (ms since epoch)
-    uint32_t fb_ts_ms;        // receiver: when feedback was sent (ms since epoch)
-    uint8_t  _pad[2];         // reserved
-};
-#pragma pack(pop)
-
-static constexpr int kFeedbackHeaderSize = 18;
-static constexpr int kMaxFeedbackPayload = 256;
-static constexpr int kMaxFeedbackPacketSize = kFeedbackHeaderSize + kMaxFeedbackPayload;
+inline void ReportFeedbackSocketError(const char* operation) {
+#ifdef _WIN32
+    std::fprintf(stderr, "FeedbackChannel: %s failed (%d)\n",
+                 operation, WSAGetLastError());
+#else
+    std::perror(operation);
+#endif
+}
 
 inline uint64_t get_timestamp_us() {
     auto now = std::chrono::steady_clock::now();
@@ -92,65 +88,84 @@ public:
     void on_packet(uint16_t seq) {
         std::lock_guard<std::mutex> lock(mu_);
         if (!initialized_) {
-            max_seq_ = seq;
-            cycles_ = 0;
-            received_ = 1;
-            expected_ = 1;
+            first_ext_seq_ = seq;
+            highest_ext_seq_ = seq;
+            seen_.fill(std::numeric_limits<uint64_t>::max());
+            seen_[seq % kSeenWindow] = seq;
             initialized_ = true;
             return;
         }
 
-        // Handle wraparound
-        uint32_t ext_seq = seq;
-        if (seq < max_seq_ && (max_seq_ - seq) > 0x8000) {
-            cycles_ += 0x10000;
-        } else if (seq > max_seq_ && (seq - max_seq_) > 0x8000) {
-            if (cycles_ >= 0x10000) cycles_ -= 0x10000;
+        uint64_t extended = (highest_ext_seq_ & ~UINT64_C(0xffff)) | seq;
+        if (extended < highest_ext_seq_ &&
+            highest_ext_seq_ - extended > 0x8000) {
+            extended += 0x10000;
+        } else if (extended > highest_ext_seq_ &&
+                   extended - highest_ext_seq_ > 0x8000) {
+            if (extended < 0x10000) return;
+            extended -= 0x10000;
         }
+        if (extended < first_ext_seq_) return;
 
-        uint32_t ext_max = cycles_ + max_seq_;
-        uint32_t ext_new = cycles_ + seq;
+        const uint64_t ext_seq = extended;
+        if (ext_seq > highest_ext_seq_) highest_ext_seq_ = ext_seq;
+        if (highest_ext_seq_ - ext_seq >= kSeenWindow) return;
 
-        if (ext_new > ext_max) {
-            expected_ += (ext_new - ext_max);
-            max_seq_ = seq;
-        }
-
-        received_++;
+        uint64_t& seen_tag = seen_[ext_seq % kSeenWindow];
+        if (seen_tag == ext_seq) return;
+        seen_tag = ext_seq;
     }
 
-    // Returns loss fraction 0-100 (percentage * 100, e.g. 5 = 0.05%)
-    uint8_t get_loss_pct_x100() {
+    // Returns the clamped loss fraction mapped to [0, 255].
+    uint8_t get_loss_q8() {
         std::lock_guard<std::mutex> lock(mu_);
-        if (!initialized_ || expected_ == 0) return 0;
-        double loss = 1.0 - (double)received_ / (double)expected_;
+        if (!initialized_) return 0;
+        constexpr uint64_t kLossWindow = 256U;
+        const uint64_t window_first =
+            highest_ext_seq_ - first_ext_seq_ + 1U > kLossWindow
+                ? highest_ext_seq_ - (kLossWindow - 1U)
+                : first_ext_seq_;
+        const uint64_t expected =
+            highest_ext_seq_ - window_first + 1U;
+        uint64_t received = 0U;
+        for (uint64_t sequence = window_first;
+             sequence <= highest_ext_seq_; ++sequence) {
+            if (seen_[sequence % kSeenWindow] == sequence) {
+                ++received;
+            }
+        }
+        double loss = 1.0 -
+            static_cast<double>(received) / static_cast<double>(expected);
         if (loss < 0) loss = 0;
         if (loss > 1) loss = 1;
-        // Return as 0-100 (percentage * 100)
-        return static_cast<uint8_t>(loss * 10000);
+        return static_cast<uint8_t>(loss * 255.0 + 0.5);
+    }
+
+    // Temporary source-compatibility alias; remove with legacy callers.
+    uint8_t get_loss_pct_x100() {
+        return get_loss_q8();
     }
 
     void reset() {
         std::lock_guard<std::mutex> lock(mu_);
         initialized_ = false;
-        received_ = 0;
-        expected_ = 0;
     }
 
 private:
+    static constexpr size_t kSeenWindow = 4096;
     std::mutex mu_;
     bool initialized_ = false;
-    uint16_t max_seq_ = 0;
-    uint32_t cycles_ = 0;
-    uint32_t received_ = 0;
-    uint32_t expected_ = 0;
+    uint64_t first_ext_seq_ = 0;
+    uint64_t highest_ext_seq_ = 0;
+    std::array<uint64_t, kSeenWindow> seen_{};
 };
 
 // ── FeedbackChannel ────────────────────────────────────────────────
 class FeedbackChannel {
 public:
     FeedbackChannel(const char* addr, uint16_t port, bool is_sender)
-        : port_(port), is_sender_(is_sender), sock_(-1), running_(false) {
+        : port_(port), bound_port_(0), is_sender_(is_sender),
+          sock_(kInvalidFeedbackSocket), running_(false) {
         if (addr) target_addr_ = addr;
     }
 
@@ -163,9 +178,13 @@ public:
 #ifdef _WIN32
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+        winsock_started_ = true;
 #endif
         sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (sock_ < 0) { perror("FeedbackChannel: socket"); return false; }
+        if (sock_ == kInvalidFeedbackSocket) {
+            ReportFeedbackSocketError("socket");
+            return false;
+        }
 
         int opt = 1;
         setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
@@ -177,12 +196,27 @@ public:
             bind_addr.sin_port = htons(port_);
             bind_addr.sin_addr.s_addr = inet_addr(target_addr_.c_str());
             if (bind(sock_, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-                perror("FeedbackChannel: bind");
-                CLOSE_SOCKET(sock_); sock_ = -1; return false;
+                ReportFeedbackSocketError("bind");
+                CLOSE_SOCKET(sock_);
+                sock_ = kInvalidFeedbackSocket;
+                return false;
             }
+            struct sockaddr_in actual_addr;
+            memset(&actual_addr, 0, sizeof(actual_addr));
+            socklen_t actual_addr_len = sizeof(actual_addr);
+            if (getsockname(sock_,
+                            reinterpret_cast<struct sockaddr*>(&actual_addr),
+                            &actual_addr_len) < 0) {
+                ReportFeedbackSocketError("getsockname");
+                CLOSE_SOCKET(sock_);
+                sock_ = kInvalidFeedbackSocket;
+                return false;
+            }
+            bound_port_.store(ntohs(actual_addr.sin_port));
             running_.store(true);
             recv_thread_ = std::thread(&FeedbackChannel::recv_loop, this);
-            printf("  Feedback: listening on %s:%d\n", target_addr_.c_str(), port_);
+            printf("  Feedback: listening on %s:%d\n",
+                   target_addr_.c_str(), bound_port_.load());
         } else {
             printf("  Feedback: sending to %s:%d\n", target_addr_.c_str(), port_);
         }
@@ -192,39 +226,64 @@ public:
     void stop() {
         running_.store(false);
         if (recv_thread_.joinable()) recv_thread_.join();
-        if (sock_ >= 0) { CLOSE_SOCKET(sock_); sock_ = -1; }
+        {
+            std::lock_guard<std::mutex> socket_lock(socket_mutex_);
+            if (sock_ != kInvalidFeedbackSocket) {
+                CLOSE_SOCKET(sock_);
+                sock_ = kInvalidFeedbackSocket;
+            }
+        }
 #ifdef _WIN32
-        WSACleanup();
+        if (winsock_started_) {
+            WSACleanup();
+            winsock_started_ = false;
+        }
 #endif
     }
 
-    // ── Receiver side: send feedback ──
-    void send_feedback(uint16_t seq, uint8_t loss_pct,
-                       uint32_t rx_ts_ms, uint32_t fb_ts_ms,
-                       const uint8_t* razor_data, int razor_size) {
-        uint8_t buf[kMaxFeedbackPacketSize];
-        FeedbackHeader* hdr = reinterpret_cast<FeedbackHeader*>(buf);
-        hdr->magic = 0xCC;
-        hdr->version = 3;
-        hdr->seq = seq;
-        hdr->loss_pct_x100 = loss_pct;
-        hdr->fb_size = static_cast<uint16_t>(razor_size);
-        hdr->rx_ts_ms = rx_ts_ms;
-        hdr->fb_ts_ms = fb_ts_ms;
-        memset(hdr->_pad, 0, sizeof(hdr->_pad));
-
-        int total = kFeedbackHeaderSize;
-        if (razor_size > 0 && razor_size <= kMaxFeedbackPayload) {
-            memcpy(buf + kFeedbackHeaderSize, razor_data, razor_size);
-            total += razor_size;
-        }
+    // ── Receiver side: send protocol-v4 feedback ──
+    bool send_feedback(const FeedbackPacket& packet) {
+        const std::vector<uint8_t> encoded = EncodeFeedbackPacket(packet);
+        if (encoded.empty()) return false;
 
         struct sockaddr_in dest;
         memset(&dest, 0, sizeof(dest));
         dest.sin_family = AF_INET;
         dest.sin_port = htons(port_);
         dest.sin_addr.s_addr = inet_addr(target_addr_.c_str());
-        sendto(sock_, (const char*)buf, total, 0, (struct sockaddr*)&dest, sizeof(dest));
+        std::lock_guard<std::mutex> socket_lock(socket_mutex_);
+        if (sock_ == kInvalidFeedbackSocket) return false;
+#ifdef _WIN32
+        const int sent = sendto(
+            sock_, reinterpret_cast<const char*>(encoded.data()),
+            static_cast<int>(encoded.size()), 0,
+            reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+#else
+        const ssize_t sent = sendto(
+            sock_, encoded.data(), encoded.size(), 0,
+            reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+#endif
+        return sent >= 0 && static_cast<size_t>(sent) == encoded.size();
+    }
+
+    // Temporary source-compatibility overload; remove in Tasks 8/9.
+    void send_feedback(uint16_t seq, uint8_t loss_pct,
+                       uint32_t rx_ts_ms, uint32_t fb_ts_ms,
+                       const uint8_t* razor_data, int razor_size) {
+        if (razor_size < 0 ||
+            static_cast<size_t>(razor_size) > kMaxFeedbackPayload ||
+            (razor_size > 0 && razor_data == nullptr)) {
+            return;
+        }
+        FeedbackPacket packet;
+        packet.sequence = seq;
+        packet.loss_q8 = loss_pct;
+        packet.receive_time_ms = rx_ts_ms;
+        packet.feedback_time_ms = fb_ts_ms;
+        if (razor_size > 0) {
+            packet.razor_payload.assign(razor_data, razor_data + razor_size);
+        }
+        send_feedback(packet);
     }
 
     // ── Sender side: poll for feedback ──
@@ -237,19 +296,45 @@ public:
         int      razor_size;
     };
 
+    bool poll(FeedbackPacket& out) {
+        std::lock_guard<std::mutex> lock(rx_mutex_);
+        if (rx_queue_.empty()) return false;
+        out = std::move(rx_queue_.front());
+        rx_queue_.pop_front();
+        return true;
+    }
+
+    // Temporary source-compatibility adapter; remove in Tasks 8/9.
     bool poll(ReceivedFeedback& out) {
         std::lock_guard<std::mutex> lock(rx_mutex_);
-        if (!rx_ready_) return false;
-        out = rx_latest_;
-        rx_ready_ = false;
+        if (rx_queue_.empty()) return false;
+        FeedbackPacket packet = std::move(rx_queue_.back());
+        rx_queue_.clear();
+        out.seq = packet.sequence;
+        out.loss_pct = packet.loss_q8;
+        out.rx_ts_ms = packet.receive_time_ms;
+        out.fb_ts_ms = packet.feedback_time_ms;
+        out.razor_size = static_cast<int>(packet.razor_payload.size());
+        if (!packet.razor_payload.empty()) {
+            memcpy(out.razor_data, packet.razor_payload.data(),
+                   packet.razor_payload.size());
+        }
         return true;
     }
 
     bool is_running() const { return running_.load(); }
+    uint16_t bound_port() const { return bound_port_.load(); }
+    size_t queued_feedback_count() {
+        std::lock_guard<std::mutex> lock(rx_mutex_);
+        return rx_queue_.size();
+    }
+    uint64_t dropped_feedback_count() const {
+        return dropped_feedback_.load();
+    }
 
 private:
     void recv_loop() {
-        char buf[kMaxFeedbackPacketSize + 64];
+        uint8_t buf[kMaxFeedbackPacketSize + 64];
         while (running_.load()) {
             fd_set fds;
             FD_ZERO(&fds);
@@ -258,46 +343,56 @@ private:
             tv.tv_sec = 0;
             tv.tv_usec = 200000;  // 200ms timeout
 
+#ifdef _WIN32
+            int sel = select(0, &fds, nullptr, nullptr, &tv);
+#else
             int sel = select(sock_ + 1, &fds, nullptr, nullptr, &tv);
+#endif
             if (sel <= 0) continue;
 
             struct sockaddr_in from;
             socklen_t from_len = sizeof(from);
-            ssize_t n = recvfrom(sock_, buf, sizeof(buf), 0,
-                                 (struct sockaddr*)&from, &from_len);
-            if (n < kFeedbackHeaderSize) continue;
+            const auto n = recvfrom(
+                sock_, reinterpret_cast<char*>(buf),
+#ifdef _WIN32
+                static_cast<int>(sizeof(buf)),
+#else
+                sizeof(buf),
+#endif
+                0, (struct sockaddr*)&from, &from_len);
+            if (n <= 0) continue;
 
-            const FeedbackHeader* hdr = reinterpret_cast<const FeedbackHeader*>(buf);
-            if (hdr->magic != 0xCC || (hdr->version != 2 && hdr->version != 3)) continue;
-
-            int fb_size = hdr->fb_size;
-            if (fb_size > kMaxFeedbackPayload) continue;
-            if (n < kFeedbackHeaderSize + fb_size) continue;
-
-            std::lock_guard<std::mutex> lock(rx_mutex_);
-            rx_latest_.seq = hdr->seq;
-            rx_latest_.loss_pct = hdr->loss_pct_x100;
-            rx_latest_.rx_ts_ms = hdr->rx_ts_ms;
-            rx_latest_.fb_ts_ms = hdr->fb_ts_ms;
-            rx_latest_.razor_size = fb_size;
-            if (fb_size > 0) {
-                memcpy(rx_latest_.razor_data, buf + kFeedbackHeaderSize, fb_size);
+            FeedbackPacket packet;
+            if (!DecodeFeedbackPacket(
+                    buf, static_cast<size_t>(n), packet)) {
+                continue;
             }
-            rx_ready_ = true;
+            std::lock_guard<std::mutex> lock(rx_mutex_);
+            if (rx_queue_.size() == kMaxQueuedFeedback) {
+                rx_queue_.pop_front();
+                dropped_feedback_.fetch_add(1);
+            }
+            rx_queue_.push_back(std::move(packet));
         }
     }
 
     uint16_t     port_;
+    std::atomic<uint16_t> bound_port_;
     bool         is_sender_;
     std::string  target_addr_;
-    int          sock_;
+    FeedbackSocket sock_;
+    std::mutex socket_mutex_;
     std::atomic<bool> running_;
     std::thread       recv_thread_;
+#ifdef _WIN32
+    bool winsock_started_ = false;
+#endif
 
     // Sender-side received data
     std::mutex        rx_mutex_;
-    ReceivedFeedback  rx_latest_{};
-    bool              rx_ready_ = false;
+    static constexpr size_t kMaxQueuedFeedback = 64;
+    std::deque<FeedbackPacket> rx_queue_;
+    std::atomic<uint64_t> dropped_feedback_{0};
 };
 
 } // namespace gcc

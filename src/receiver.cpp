@@ -1,70 +1,65 @@
 /**
- * H.264 + GCC Video Receiver (GStreamer C++ + razor GCC)
+ * H.264 + GCC video receiver.
  *
- * Uses razor library for standard GCC bandwidth estimation.
- * Razor generates feedback; we send it back via UDP feedback channel.
+ * The GStreamer streaming thread only parses/re-writes RTP and queues packet
+ * arrivals. All razor calls and feedback generation run on the main control
+ * thread.
  */
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <csignal>
-#include <atomic>
+#include <deque>
+#include <mutex>
 #include <thread>
-#include <chrono>
+#include <vector>
 
 #include <gst/gst.h>
-#include "gst_compat.h"
+
 #include "feedback_channel.h"
+#include "feedback_packet.h"
 #include "razor_wrapper.h"
+#include "rtp_packet.h"
 
-static std::atomic<bool> running{true};
-static std::atomic<uint64_t> frame_count{0};
-static void signal_handler(int) { running.store(false); }
+namespace {
 
-static bool parse_rtp_seq(const uint8_t* data, size_t len, uint16_t& seq) {
-    if (len < 12) return false;
-    seq = (static_cast<uint16_t>(data[2]) << 8) | data[3];
-    return true;
+constexpr size_t kMaxArrivalEvents = 4096U;
+
+std::atomic<bool> running{true};
+std::atomic<uint64_t> frame_count{0U};
+
+void SignalHandler(int) {
+    running.store(false);
 }
 
-struct ReceiverProbeData {
-    razor::Receiver* razor_rx;
-    uint16_t* last_seq;
-    uint64_t* total_rx_packets;
-    gcc::LossTracker* loss_tracker;
-    std::atomic<uint32_t>* last_rx_ts_ms;
-};
+uint32_t SteadyMillisLow32() {
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    return static_cast<uint32_t>(now_ms & UINT64_C(0xffffffff));
+}
 
-static GstPadProbeReturn rtp_in_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data) {
-    auto* d = static_cast<ReceiverProbeData*>(user_data);
-    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!buf) return GST_PAD_PROBE_OK;
-    GstMapInfo map;
-    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
-
-    uint16_t seq = 0;
-    if (parse_rtp_seq(map.data, map.size, seq)) {
-        *d->last_seq = seq;
-        (*d->total_rx_packets)++;
-        // Record receive timestamp for RTT estimation
-        uint32_t now_ms = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
-        d->last_rx_ts_ms->store(now_ms);
-        // Track loss from RTP sequence numbers
-        if (d->loss_tracker) d->loss_tracker->on_packet(seq);
-        // Notify razor of received packet with real timestamp
-        uint32_t ts = now_ms;
-        d->razor_rx->on_received(seq, ts, map.size);
+int ParseBoundedInt(const char* text, int minimum, int maximum,
+                    int fallback) {
+    if (text == nullptr || *text == '\0') {
+        return fallback;
     }
-
-    gst_buffer_unmap(buf, &map);
-    return GST_PAD_PROBE_OK;
-}
-
-static GstPadProbeReturn count_probe(GstPad*, GstPadProbeInfo*, gpointer) {
-    frame_count.fetch_add(1, std::memory_order_relaxed);
-    return GST_PAD_PROBE_OK;
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0') {
+        return fallback;
+    }
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return static_cast<int>(value);
 }
 
 struct ReceiverConfig {
@@ -72,157 +67,432 @@ struct ReceiverConfig {
     const char* sender_host = "127.0.0.1";
 };
 
-static void parse_args(int argc, char* argv[], ReceiverConfig& cfg) {
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--port") == 0 && i+1 < argc) cfg.rtp_port = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--sender-host") == 0 && i+1 < argc) cfg.sender_host = argv[++i];
+void ParseArgs(int argc, char* argv[], ReceiverConfig& config) {
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--port") == 0 &&
+            index + 1 < argc) {
+            config.rtp_port =
+                ParseBoundedInt(argv[++index], 1, 65534, config.rtp_port);
+        } else if (std::strcmp(argv[index], "--sender-host") == 0 &&
+                   index + 1 < argc) {
+            config.sender_host = argv[++index];
+        }
     }
 }
 
-int main(int argc, char* argv[]) {
-    ReceiverConfig cfg;
-    parse_args(argc, argv, cfg);
+struct PacketArrival {
+    uint16_t transport_sequence;
+    uint32_t arrival_ms;
+    size_t size;
+    bool probe;
+};
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+class ArrivalQueue {
+public:
+    bool Push(const PacketArrival& arrival) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (queue_.size() >= kMaxArrivalEvents) {
+                overflow_.fetch_add(1U);
+                return false;
+            }
+            queue_.push_back(arrival);
+            return true;
+        } catch (...) {
+            overflow_.fetch_add(1U);
+            return false;
+        }
+    }
+
+    void Drain(std::deque<PacketArrival>& output) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        output.clear();
+        output.swap(queue_);
+    }
+
+    uint64_t overflow() const noexcept {
+        return overflow_.load();
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<PacketArrival> queue_;
+    std::atomic<uint64_t> overflow_{0U};
+};
+
+struct ReceiverProbeContext {
+    ArrivalQueue* arrivals;
+    gcc::MediaSequenceTranslator translator;
+    std::atomic<uint64_t> media_reorder_drops{0U};
+};
+
+GstPadProbeReturn OnRtpPacket(
+    GstPad*, GstPadProbeInfo* info, gpointer user_data) {
+    ReceiverProbeContext* context =
+        static_cast<ReceiverProbeContext*>(user_data);
+    if (context == nullptr || context->arrivals == nullptr) {
+        return GST_PAD_PROBE_DROP;
+    }
+
+    try {
+        GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        if (buffer == nullptr) {
+            return GST_PAD_PROBE_DROP;
+        }
+
+        GstMapInfo read_map = GST_MAP_INFO_INIT;
+        if (!gst_buffer_map(buffer, &read_map, GST_MAP_READ)) {
+            return GST_PAD_PROBE_DROP;
+        }
+
+        gcc::RtpHeader header;
+        const bool parsed = gcc::ParseRtpHeader(
+            read_map.data, read_map.size, header);
+        const bool probe =
+            parsed && gcc::IsProbeRtpPacket(
+                          read_map.data, read_map.size);
+        const size_t packet_size = read_map.size;
+        gst_buffer_unmap(buffer, &read_map);
+        if (!parsed) {
+            return GST_PAD_PROBE_OK;
+        }
+
+        const PacketArrival arrival{
+            header.sequence, SteadyMillisLow32(), packet_size, probe};
+        context->arrivals->Push(arrival);
+        if (probe) {
+            context->translator.OnProbe(header.sequence);
+            return GST_PAD_PROBE_DROP;
+        }
+
+        uint16_t media_sequence = 0U;
+        if (!context->translator.TranslateMedia(
+                header.sequence, media_sequence)) {
+            context->media_reorder_drops.fetch_add(
+                1U, std::memory_order_relaxed);
+            return GST_PAD_PROBE_DROP;
+        }
+        if (media_sequence != header.sequence) {
+            GstBuffer* writable = gst_buffer_make_writable(buffer);
+            if (writable == nullptr) {
+                return GST_PAD_PROBE_DROP;
+            }
+            GST_PAD_PROBE_INFO_DATA(info) = writable;
+
+            GstMapInfo write_map = GST_MAP_INFO_INIT;
+            if (!gst_buffer_map(writable, &write_map, GST_MAP_READWRITE)) {
+                return GST_PAD_PROBE_DROP;
+            }
+            const bool rewritten = gcc::RewriteRtpSequence(
+                write_map.data, write_map.size, media_sequence);
+            gst_buffer_unmap(writable, &write_map);
+            if (!rewritten) {
+                return GST_PAD_PROBE_DROP;
+            }
+        }
+
+        return GST_PAD_PROBE_OK;
+    } catch (...) {
+        return GST_PAD_PROBE_DROP;
+    }
+}
+
+GstPadProbeReturn CountFrame(
+    GstPad*, GstPadProbeInfo*, gpointer) {
+    frame_count.fetch_add(1U, std::memory_order_relaxed);
+    return GST_PAD_PROBE_OK;
+}
+
+void UnrefCreatedElements(
+    GstElement* pipeline, const std::vector<GstElement*>& elements) {
+    for (GstElement* element : elements) {
+        if (element != nullptr) {
+            gst_object_unref(element);
+        }
+    }
+    if (pipeline != nullptr) {
+        gst_object_unref(pipeline);
+    }
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    ReceiverConfig config;
+    ParseArgs(argc, argv, config);
+
+    signal(SIGINT, SignalHandler);
+    signal(SIGTERM, SignalHandler);
     gst_init(&argc, &argv);
 
-    int feedback_port = cfg.rtp_port + 1;
+    const uint16_t rtp_port =
+        static_cast<uint16_t>(config.rtp_port);
+    const uint16_t feedback_port =
+        static_cast<uint16_t>(config.rtp_port + 1);
 
-    printf("============================================================\n");
-    printf("H.264 + GCC Video Receiver (razor GCC v4.0)\n");
-    printf("============================================================\n");
-    printf("  RTP port:       %d\n", cfg.rtp_port);
-    printf("  Feedback port:  %s:%d\n", cfg.sender_host, feedback_port);
-    printf("============================================================\n\n");
+    std::printf("============================================================\n");
+    std::printf("H.264 + GCC Video Receiver (razor GCC v4.0)\n");
+    std::printf("============================================================\n");
+    std::printf("  RTP port:       %u\n", rtp_port);
+    std::printf("  Feedback port:  %s:%u\n",
+                config.sender_host, feedback_port);
+    std::printf("============================================================\n\n");
 
-    // ── Feedback channel (sends to sender) ──
-    gcc::FeedbackChannel feedback(cfg.sender_host, feedback_port, false);
-    gcc::LossTracker loss_tracker;
+    gcc::FeedbackChannel feedback(
+        config.sender_host, feedback_port, false);
     if (!feedback.start()) {
-        fprintf(stderr, "ERROR: Failed to start feedback channel\n");
-        return 1;
+        std::fprintf(stderr, "ERROR: Failed to start feedback channel\n");
+        return EXIT_FAILURE;
     }
 
-    // ── Razor receiver (generates GCC feedback) ──
-    uint16_t last_feedback_seq = 0;
-    std::atomic<uint32_t> last_rx_ts_ms{0};
-    razor::Receiver razor_rx([&](const uint8_t* data, int size) {
-        uint8_t loss_pct_x100 = loss_tracker.get_loss_pct_x100();
-        uint32_t now_ms = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFF);
-        feedback.send_feedback(last_feedback_seq, loss_pct_x100,
-                               last_rx_ts_ms.load(), now_ms, data, size);
-    });
-    if (!razor_rx.is_valid()) {
-        fprintf(stderr, "ERROR: Failed to create razor receiver\n");
-        return 1;
+    gcc::LossTracker loss_tracker;
+    bool has_processed_arrival = false;
+    uint16_t last_processed_sequence = 0U;
+    uint32_t last_processed_arrival_ms = 0U;
+    razor::Receiver razor_receiver(
+        [&](const uint8_t* data, int size) {
+            try {
+                if (!has_processed_arrival || size < 0 ||
+                    static_cast<size_t>(size) >
+                        gcc::kMaxFeedbackPayload ||
+                    (size > 0 && data == nullptr)) {
+                    return;
+                }
+                gcc::FeedbackPacket packet;
+                packet.sequence = last_processed_sequence;
+                packet.loss_q8 = loss_tracker.get_loss_q8();
+                packet.receive_time_ms =
+                    last_processed_arrival_ms;
+                packet.feedback_time_ms = SteadyMillisLow32();
+                if (size > 0) {
+                    packet.razor_payload.assign(data, data + size);
+                }
+                feedback.send_feedback(packet);
+            } catch (...) {
+                // Never let allocation or socket exceptions cross the C ABI.
+            }
+        });
+    if (!razor_receiver.is_valid()) {
+        std::fprintf(stderr, "ERROR: Failed to create razor receiver\n");
+        feedback.stop();
+        return EXIT_FAILURE;
     }
 
-    // ── GStreamer receiver pipeline ──
-    GstElement *pipeline, *udpsrc, *depay, *parser, *decoder, *convert, *sink;
-    pipeline = gst_pipeline_new("receiver-pipeline");
-    udpsrc   = gst_element_factory_make("udpsrc",         "rtp-src");
-    depay    = gst_element_factory_make("rtph264depay",   "rtp-depay");
-    parser   = gst_element_factory_make("h264parse",      "h264-parser");
-    decoder  = gst_element_factory_make("avdec_h264",     "h264-decoder");
-    convert  = gst_element_factory_make("videoconvert",   "video-convert");
-    sink     = gst_element_factory_make("fakesink",       "video-sink");
-
-    if (!pipeline || !udpsrc || !depay || !parser || !decoder || !convert || !sink) {
-        fprintf(stderr, "ERROR: Failed to create receiver elements\n");
-        return 1;
+    GstElement* pipeline = gst_pipeline_new("receiver-pipeline");
+    GstElement* udp_source =
+        gst_element_factory_make("udpsrc", "rtp-source");
+    GstElement* depayloader =
+        gst_element_factory_make("rtph264depay", "rtp-depayloader");
+    GstElement* parser =
+        gst_element_factory_make("h264parse", "h264-parser");
+    GstElement* decoder =
+        gst_element_factory_make("avdec_h264", "h264-decoder");
+    GstElement* convert =
+        gst_element_factory_make("videoconvert", "video-convert");
+    GstElement* sink =
+        gst_element_factory_make("fakesink", "video-sink");
+    const std::vector<GstElement*> created = {
+        udp_source, depayloader, parser, decoder, convert, sink};
+    if (pipeline == nullptr || udp_source == nullptr ||
+        depayloader == nullptr || parser == nullptr ||
+        decoder == nullptr || convert == nullptr || sink == nullptr) {
+        std::fprintf(stderr, "ERROR: Failed to create receiver elements\n");
+        UnrefCreatedElements(pipeline, created);
+        feedback.stop();
+        return EXIT_FAILURE;
     }
 
-    GstCaps* rtp_caps = gst_caps_new_simple("application/x-rtp",
-        "media", G_TYPE_STRING, "video",
+    GstCaps* rtp_caps = gst_caps_new_simple(
+        "application/x-rtp", "media", G_TYPE_STRING, "video",
         "encoding-name", G_TYPE_STRING, "H264",
         "clock-rate", G_TYPE_INT, 90000, nullptr);
-    g_object_set(udpsrc, "port", cfg.rtp_port, "caps", rtp_caps, nullptr);
+    g_object_set(
+        udp_source, "port", static_cast<gint>(rtp_port),
+        "caps", rtp_caps, nullptr);
     gst_caps_unref(rtp_caps);
     g_object_set(parser, "config-interval", -1, nullptr);
     g_object_set(sink, "sync", FALSE, "silent", TRUE, nullptr);
 
-    gst_bin_add_many(GST_BIN(pipeline), udpsrc, depay, parser, decoder, convert, sink, nullptr);
-    if (!gst_element_link_many(udpsrc, depay, parser, decoder, convert, sink, nullptr)) {
-        fprintf(stderr, "ERROR: Failed to link receiver pipeline\n");
-        return 1;
+    gst_bin_add_many(
+        GST_BIN(pipeline), udp_source, depayloader, parser, decoder,
+        convert, sink, nullptr);
+    if (!gst_element_link_many(
+            udp_source, depayloader, parser, decoder, convert, sink,
+            nullptr)) {
+        std::fprintf(stderr, "ERROR: Failed to link receiver pipeline\n");
+        gst_object_unref(pipeline);
+        feedback.stop();
+        return EXIT_FAILURE;
     }
 
-    // ── Pad probes ──
-    uint16_t last_rtp_seq = 0;
-    uint64_t total_rx_packets = 0;
-    ReceiverProbeData probe_data = { &razor_rx, &last_rtp_seq, &total_rx_packets, &loss_tracker, &last_rx_ts_ms };
-
-    GstPad* udpsrc_src = gst_element_get_static_pad(udpsrc, "src");
-    if (udpsrc_src) {
-        gst_pad_add_probe(udpsrc_src, GST_PAD_PROBE_TYPE_BUFFER, rtp_in_probe, &probe_data, nullptr);
-        gst_object_unref(udpsrc_src);
+    ArrivalQueue arrival_queue;
+    ReceiverProbeContext probe_context{&arrival_queue, {}};
+    GstPad* source_pad =
+        gst_element_get_static_pad(udp_source, "src");
+    GstPad* sink_pad =
+        gst_element_get_static_pad(sink, "sink");
+    if (source_pad == nullptr || sink_pad == nullptr) {
+        std::fprintf(stderr, "ERROR: Failed to get receiver pads\n");
+        if (source_pad != nullptr) {
+            gst_object_unref(source_pad);
+        }
+        if (sink_pad != nullptr) {
+            gst_object_unref(sink_pad);
+        }
+        gst_object_unref(pipeline);
+        feedback.stop();
+        return EXIT_FAILURE;
     }
-    GstPad* sink_pad = gst_element_get_static_pad(sink, "sink");
-    if (sink_pad) {
-        gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER, count_probe, nullptr, nullptr);
+    const gulong rtp_probe_id = gst_pad_add_probe(
+        source_pad, GST_PAD_PROBE_TYPE_BUFFER,
+        OnRtpPacket, &probe_context, nullptr);
+    const gulong frame_probe_id = gst_pad_add_probe(
+        sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
+        CountFrame, nullptr, nullptr);
+    if (rtp_probe_id == 0U || frame_probe_id == 0U) {
+        std::fprintf(stderr, "ERROR: Failed to install receiver probes\n");
+        if (rtp_probe_id != 0U) {
+            gst_pad_remove_probe(source_pad, rtp_probe_id);
+        }
+        if (frame_probe_id != 0U) {
+            gst_pad_remove_probe(sink_pad, frame_probe_id);
+        }
+        gst_object_unref(source_pad);
         gst_object_unref(sink_pad);
+        gst_object_unref(pipeline);
+        feedback.stop();
+        return EXIT_FAILURE;
     }
 
-    // ── Start ──
     GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-    gst_bus_add_signal_watch(bus);
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (bus == nullptr ||
+        gst_element_set_state(pipeline, GST_STATE_PLAYING) ==
+            GST_STATE_CHANGE_FAILURE) {
+        std::fprintf(stderr, "ERROR: Failed to start receiver pipeline\n");
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_element_get_state(
+            pipeline, nullptr, nullptr, 2U * GST_SECOND);
+        if (rtp_probe_id != 0U) {
+            gst_pad_remove_probe(source_pad, rtp_probe_id);
+        }
+        if (frame_probe_id != 0U) {
+            gst_pad_remove_probe(sink_pad, frame_probe_id);
+        }
+        if (bus != nullptr) {
+            gst_object_unref(bus);
+        }
+        gst_object_unref(source_pad);
+        gst_object_unref(sink_pad);
+        gst_object_unref(pipeline);
+        feedback.stop();
+        return EXIT_FAILURE;
+    }
+    gst_element_get_state(pipeline, nullptr, nullptr, 2U * GST_SECOND);
 
-    printf("  Receiver PLAYING on port %d\n", cfg.rtp_port);
-    printf("  Razor GCC feedback active\n\n");
+    std::printf("  Receiver PLAYING on port %u\n", rtp_port);
+    std::printf("  Razor GCC feedback active\n\n");
+    std::fflush(stdout);
 
-    auto start = std::chrono::steady_clock::now();
-    auto last_heartbeat = start;
-    int last_sec = -1;
+    uint64_t total_rx_packets = 0U;
+    bool loop_error = false;
+    auto last_stats = std::chrono::steady_clock::now();
+    auto last_heartbeat = last_stats;
+    std::deque<PacketArrival> arrivals;
+
+    const auto process_arrivals = [&]() {
+        arrival_queue.Drain(arrivals);
+        for (const PacketArrival& arrival : arrivals) {
+            loss_tracker.on_packet(arrival.transport_sequence);
+            last_processed_sequence = arrival.transport_sequence;
+            last_processed_arrival_ms = arrival.arrival_ms;
+            has_processed_arrival = true;
+            razor_receiver.on_received(
+                arrival.transport_sequence, arrival.arrival_ms,
+                arrival.size);
+            ++total_rx_packets;
+        }
+        arrivals.clear();
+    };
 
     while (running.load()) {
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - start).count();
-
-        GstMessage* msg = gst_bus_pop_filtered(bus, (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
-        if (msg) {
-            if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-                GError* err = nullptr; gchar* debug = nullptr;
-                gst_message_parse_error(msg, &err, &debug);
-                fprintf(stderr, "Error: %s\n", err->message);
-                g_error_free(err); g_free(debug);
-                running.store(false);
+        GstMessage* message = gst_bus_pop_filtered(
+            bus, static_cast<GstMessageType>(
+                     GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+        if (message != nullptr) {
+            if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+                GError* error = nullptr;
+                gchar* debug = nullptr;
+                gst_message_parse_error(message, &error, &debug);
+                std::fprintf(stderr, "ERROR: %s\n",
+                             error != nullptr ? error->message : "unknown");
+                if (error != nullptr) {
+                    g_error_free(error);
+                }
+                g_free(debug);
+                loop_error = true;
             }
-            gst_message_unref(msg);
+            gst_message_unref(message);
             break;
         }
 
-        // Razor heartbeat (every ~5ms)
-        auto hb_now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(hb_now - last_heartbeat).count() >= 0.005) {
-            razor_rx.heartbeat();
-            last_heartbeat = hb_now;
+        process_arrivals();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_heartbeat)
+                .count() >= 5) {
+            razor_receiver.heartbeat();
+            last_heartbeat = now;
         }
-
-        // Print stats every second
-        int sec = static_cast<int>(elapsed);
-        if (sec != last_sec && sec > 0) {
-            last_sec = sec;
-            printf("  [%3ds] RX:%lu frames  Packets:%lu\n",
-                   sec,
-                   (unsigned long)frame_count.load(std::memory_order_relaxed),
-                   (unsigned long)total_rx_packets);
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_stats)
+                .count() >= 1) {
+            std::printf(
+                "receiver_stats frames=%llu packets=%llu "
+                "arrival_overflow=%llu media_reorder_drops=%llu "
+                "last_sequence=%u\n",
+                static_cast<unsigned long long>(
+                    frame_count.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(total_rx_packets),
+                static_cast<unsigned long long>(
+                    arrival_queue.overflow()),
+                static_cast<unsigned long long>(
+                    probe_context.media_reorder_drops.load(
+                        std::memory_order_relaxed)),
+                static_cast<unsigned>(last_processed_sequence));
+            std::fflush(stdout);
+            last_stats = now;
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    printf("\nStopping receiver...\n");
     gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_element_get_state(pipeline, nullptr, nullptr, 2U * GST_SECOND);
+    if (rtp_probe_id != 0U) {
+        gst_pad_remove_probe(source_pad, rtp_probe_id);
+    }
+    if (frame_probe_id != 0U) {
+        gst_pad_remove_probe(sink_pad, frame_probe_id);
+    }
+    process_arrivals();
+    razor_receiver.heartbeat();
     feedback.stop();
+
+    std::printf(
+        "receiver_stats frames=%llu packets=%llu arrival_overflow=%llu "
+        "media_reorder_drops=%llu last_sequence=%u\n",
+        static_cast<unsigned long long>(
+            frame_count.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(total_rx_packets),
+        static_cast<unsigned long long>(arrival_queue.overflow()),
+        static_cast<unsigned long long>(
+            probe_context.media_reorder_drops.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned>(last_processed_sequence));
+    std::fflush(stdout);
+
+    gst_object_unref(source_pad);
+    gst_object_unref(sink_pad);
     gst_object_unref(bus);
     gst_object_unref(pipeline);
-
-    printf("  Receiver stopped — %lu frames, %lu packets\n",
-           (unsigned long)frame_count.load(),
-           (unsigned long)total_rx_packets);
-    return 0;
+    return loop_error ? EXIT_FAILURE : EXIT_SUCCESS;
 }

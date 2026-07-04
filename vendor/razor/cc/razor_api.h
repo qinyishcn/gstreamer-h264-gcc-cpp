@@ -31,12 +31,22 @@ enum
 	remb_congestion = 2
 };
 
+typedef struct {
+	uint32_t acked_bitrate_bps;
+	int delay_state;
+	uint64_t matched_feedback_packets;
+	int64_t pacer_queue_ms;
+} razor_sender_stats_t;
+
 /****************************************外部直接调用API************************************/
 void				razor_setup_log(razor_log_func log_cb);
 /*创建一个发送端的拥塞控制对象*/
 razor_sender_t*		razor_sender_create(int type, int padding, void* trigger, bitrate_changed_func bitrate_cb, void* handler, pace_send_func send_cb, int queue_ms);
 /*销毁一个发送端的拥塞控制对象*/
 void				razor_sender_destroy(razor_sender_t* sender);
+/* Returns -1 for NULL or sender types without configurable pacing. */
+int					razor_sender_set_pacing_rate(razor_sender_t* sender, uint32_t bitrate_bps);
+int					razor_sender_get_stats(razor_sender_t* sender, razor_sender_stats_t* stats);
 
 razor_receiver_t*	razor_receiver_create(int type, int min_bitrate, int max_bitrate, int packet_header_size, void* handler, send_feedback_func cb);
 void				razor_receiver_destroy(razor_receiver_t* receiver);

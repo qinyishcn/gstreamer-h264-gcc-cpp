@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <vector>
 
 extern "C" {
@@ -19,6 +20,33 @@ namespace razor {
 
 static constexpr uint32_t kBpsPerKbps = 1000;
 
+namespace detail {
+
+constexpr uint32_t KbpsToBps(uint32_t kbps) {
+    return kbps > std::numeric_limits<uint32_t>::max() / kBpsPerKbps
+               ? std::numeric_limits<uint32_t>::max()
+               : kbps * kBpsPerKbps;
+}
+
+constexpr int QueueMsToInt(uint32_t queue_ms) {
+    return queue_ms > static_cast<uint32_t>(std::numeric_limits<int>::max())
+               ? std::numeric_limits<int>::max()
+               : static_cast<int>(queue_ms);
+}
+
+}  // namespace detail
+
+using PaceSendCallback = std::function<void(uint32_t, int, size_t, bool)>;
+using PacingRateApplier =
+    std::function<int(razor_sender_t*, uint32_t bitrate_bps)>;
+
+struct SenderStats {
+    uint32_t acked_bitrate_kbps = 0;
+    int delay_state = 0;
+    uint64_t matched_feedback_packets = 0;
+    int64_t pacer_queue_ms = 0;
+};
+
 // Feedback data buffer (razor feedback is variable-length binary)
 struct FeedbackData {
     uint8_t data[256];
@@ -28,24 +56,61 @@ struct FeedbackData {
 // ── Sender Wrapper ──────────────────────────────────────────────────
 class Sender {
 public:
+    // Sender, its methods, and all callbacks must run on one serialized
+    // control thread. Bitrate and pacing callbacks must not destroy Sender.
     // bitrate_changed_cb: called when razor estimates a new bitrate (kbps)
-    Sender(std::function<void(uint32_t kbps, uint8_t loss, uint32_t rtt)> bitrate_changed_cb) {
+    Sender(std::function<void(uint32_t kbps, uint8_t loss, uint32_t rtt)> bitrate_changed_cb,
+           PaceSendCallback pace_send_cb = PaceSendCallback(),
+           uint32_t queue_ms = 250,
+           PacingRateApplier pacing_rate_applier = PacingRateApplier()) {
         bitrate_cb_ = bitrate_changed_cb;
+        pace_cb_ = pace_send_cb;
+        pacing_rate_applier_ = pacing_rate_applier;
         sender_ = razor_sender_create(
             0,  // gcc_congestion
             0,  // no padding
             this,
-            [](void* trigger, uint32_t bitrate_bps, uint8_t loss, uint32_t rtt) {
+            [](void* trigger, uint32_t bitrate_bps, uint8_t loss,
+               uint32_t rtt) noexcept {
                 auto* self = static_cast<Sender*>(trigger);
+                if (!self) return;
                 // Convert bps -> kbps for the callback
-                if (self->bitrate_cb_)
-                    self->bitrate_cb_(bitrate_bps / kBpsPerKbps, loss, rtt);
+                try {
+                    if (self->bitrate_cb_)
+                        self->bitrate_cb_(
+                            bitrate_bps / kBpsPerKbps, loss, rtt);
+                } catch (...) {
+                    // Never allow a C++ exception to cross the C callback ABI.
+                }
+                try {
+                    self->RestoreExplicitPacingRate();
+                } catch (...) {
+                    // The injected applier follows the same C ABI boundary.
+                }
             },
-            nullptr,  // handler (unused, no pacer)
-            nullptr,  // pace_send_cb (unused, GStreamer sends)
-            0         // queue_ms (unused)
+            this,
+            [](void* handler, uint32_t packet_id, int retrans, size_t size,
+               int padding) {
+                auto* self = static_cast<Sender*>(handler);
+                if (!self || self->in_pace_callback_)
+                    return;
+                self->in_pace_callback_ = true;
+                try {
+                    if (self->pace_cb_)
+                        self->pace_cb_(packet_id, retrans, size, padding != 0);
+                } catch (...) {
+                    // Never allow a C++ exception to cross the C callback ABI.
+                }
+                self->in_pace_callback_ = false;
+            },
+            detail::QueueMsToInt(queue_ms)
         );
     }
+
+    Sender(const Sender&) = delete;
+    Sender& operator=(const Sender&) = delete;
+    Sender(Sender&&) = delete;
+    Sender& operator=(Sender&&) = delete;
 
     ~Sender() {
         if (sender_) razor_sender_destroy(sender_);
@@ -55,7 +120,7 @@ public:
 
     // Call every 5-10ms
     void heartbeat() {
-        if (sender_) sender_->heartbeat(sender_);
+        if (sender_ && !in_pace_callback_) sender_->heartbeat(sender_);
     }
 
     // Notify razor that a packet was sent (transport_seq = RTP seq)
@@ -78,15 +143,66 @@ public:
         if (sender_) {
             // Convert kbps -> bps for razor API
             sender_->set_bitrates(sender_,
-                min_kbps * kBpsPerKbps,
-                start_kbps * kBpsPerKbps,
-                max_kbps * kBpsPerKbps);
+                detail::KbpsToBps(min_kbps),
+                detail::KbpsToBps(start_kbps),
+                detail::KbpsToBps(max_kbps));
+            RestoreExplicitPacingRate();
         }
     }
 
+    void set_pacing_rate(uint32_t bitrate_kbps) {
+        configured_pacing_rate_kbps_ = bitrate_kbps;
+        has_explicit_pacing_rate_ = true;
+        RestoreExplicitPacingRate();
+    }
+
+    bool add_packet(uint32_t packet_id, bool retrans, size_t size) {
+        return sender_ && sender_->add_packet &&
+               sender_->add_packet(sender_, packet_id, retrans ? 1 : 0, size) == 0;
+    }
+
+    int64_t pacer_queue_ms() const {
+        if (!sender_ || !sender_->get_pacer_queue_ms)
+            return 0;
+        const int64_t queue_ms = sender_->get_pacer_queue_ms(sender_);
+        return queue_ms > 0 ? queue_ms : 0;
+    }
+
+    SenderStats stats() const {
+        SenderStats result;
+        razor_sender_stats_t raw = {};
+        if (razor_sender_get_stats(sender_, &raw) == 0) {
+            result.acked_bitrate_kbps =
+                raw.acked_bitrate_bps / kBpsPerKbps;
+            result.delay_state = raw.delay_state;
+            result.matched_feedback_packets =
+                raw.matched_feedback_packets;
+            result.pacer_queue_ms =
+                raw.pacer_queue_ms > 0 ? raw.pacer_queue_ms : 0;
+        }
+        return result;
+    }
+
 private:
+    void RestoreExplicitPacingRate() {
+        if (sender_ && has_explicit_pacing_rate_) {
+            const uint32_t bitrate_bps =
+                detail::KbpsToBps(configured_pacing_rate_kbps_);
+            if (pacing_rate_applier_) {
+                pacing_rate_applier_(sender_, bitrate_bps);
+            } else {
+                razor_sender_set_pacing_rate(sender_, bitrate_bps);
+            }
+        }
+    }
+
     razor_sender_t* sender_ = nullptr;
     std::function<void(uint32_t kbps, uint8_t loss, uint32_t rtt)> bitrate_cb_;
+    PaceSendCallback pace_cb_;
+    PacingRateApplier pacing_rate_applier_;
+    bool in_pace_callback_ = false;
+    bool has_explicit_pacing_rate_ = false;
+    uint32_t configured_pacing_rate_kbps_ = 0U;
 };
 
 // ── Receiver Wrapper ────────────────────────────────────────────────
@@ -107,6 +223,11 @@ public:
             }
         );
     }
+
+    Receiver(const Receiver&) = delete;
+    Receiver& operator=(const Receiver&) = delete;
+    Receiver(Receiver&&) = delete;
+    Receiver& operator=(Receiver&&) = delete;
 
     ~Receiver() {
         if (receiver_) razor_receiver_destroy(receiver_);
