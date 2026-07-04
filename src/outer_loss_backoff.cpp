@@ -10,11 +10,11 @@ OuterLossBackoff::OuterLossBackoff(uint32_t min_kbps)
 OuterLossDecision OuterLossBackoff::Evaluate(
     uint8_t loss_q8, uint32_t current_kbps, uint32_t,
     uint64_t, bool enabled, bool base_controller_reduced) {
-    if (!enabled) return {};
     if (loss_q8 <= 25U) {
         high_loss_episode_ = false;
         return {};
     }
+    if (!enabled) return {};
 
     // A base-controller reduction already handled this feedback. Keep the
     // emergency fallback armed in case high loss persists after the base

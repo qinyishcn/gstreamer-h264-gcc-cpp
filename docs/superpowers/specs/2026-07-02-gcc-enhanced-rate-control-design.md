@@ -276,6 +276,11 @@ factor:
 - never exceed the configured maximum probe rate;
 - abort probing when pacing queue delay exceeds its limit.
 
+The C++ wire pacer recomputes its next deadline from the last successfully
+sent packet's size and send time whenever the configured rate changes. A
+decrease therefore obeys the new ceiling immediately at packet granularity,
+while an increase does not retain an unnecessary deadline from the old rate.
+
 ## 7. Required Razor Corrections
 
 Make only focused changes to vendored razor:

@@ -23,6 +23,26 @@ namespace gcc {
 namespace {
 
 constexpr size_t kSendHistoryLimit = 2000;
+constexpr uint64_t kMicrosPerByteAtOneKbps = 8000U;
+
+uint64_t PacingIntervalUs(size_t bytes, uint32_t rate_kbps) {
+    if (rate_kbps == 0U) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const uint64_t numerator =
+        bytes > maximum / kMicrosPerByteAtOneKbps
+            ? maximum
+            : static_cast<uint64_t>(bytes) *
+                  kMicrosPerByteAtOneKbps;
+    return numerator / rate_kbps +
+           (numerator % rate_kbps != 0U ? 1U : 0U);
+}
+
+uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    return right > maximum - left ? maximum : left + right;
+}
 
 struct UdpSocketState {
 #ifdef _WIN32
@@ -135,6 +155,9 @@ struct TransportSender::Impl {
     std::unordered_set<uint32_t> vendor_callback_pending;
     uint32_t pacing_rate_kbps = 0U;
     uint64_t next_send_time_us = 0U;
+    uint64_t last_send_time_us = 0U;
+    size_t last_sent_size = 0U;
+    bool has_last_send = false;
     uint64_t next_probe_epoch = 0U;
     uint64_t active_probe_epoch = 0U;
     bool has_latest_media_header = false;
@@ -371,6 +394,12 @@ bool TransportSender::SendPaced(uint32_t packet_id, SentPacket& out) {
 
 void TransportSender::SetPacingRate(uint32_t bitrate_kbps) {
     impl_->pacing_rate_kbps = bitrate_kbps;
+    if (bitrate_kbps != 0U && impl_->has_last_send) {
+        impl_->next_send_time_us = SaturatingAdd(
+            impl_->last_send_time_us,
+            PacingIntervalUs(
+                impl_->last_sent_size, bitrate_kbps));
+    }
 }
 
 bool TransportSender::SchedulePaced(uint32_t packet_id) {
@@ -466,23 +495,17 @@ size_t TransportSender::FlushPaced(const SentFunction& on_sent) {
             }
         }
 
-        constexpr uint64_t kMicrosPerByteAtOneKbps = 8000U;
-        const uint64_t maximum = std::numeric_limits<uint64_t>::max();
-        const uint64_t numerator =
-            sent.size > maximum / kMicrosPerByteAtOneKbps
-                ? maximum
-                : static_cast<uint64_t>(sent.size) *
-                      kMicrosPerByteAtOneKbps;
         const uint64_t interval_us =
-            numerator / impl_->pacing_rate_kbps +
-            (numerator % impl_->pacing_rate_kbps != 0U ? 1U : 0U);
+            PacingIntervalUs(sent.size, impl_->pacing_rate_kbps);
         const uint64_t base =
             impl_->next_send_time_us == 0U ||
                     sent.send_time_us > impl_->next_send_time_us
                 ? sent.send_time_us
                 : impl_->next_send_time_us;
-        impl_->next_send_time_us =
-            interval_us > maximum - base ? maximum : base + interval_us;
+        impl_->last_send_time_us = sent.send_time_us;
+        impl_->last_sent_size = sent.size;
+        impl_->has_last_send = true;
+        impl_->next_send_time_us = SaturatingAdd(base, interval_us);
     }
     return sent_count;
 }

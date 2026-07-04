@@ -10,7 +10,8 @@ constexpr size_t kFixedHeaderSize = 12;
 constexpr size_t kProbeMagicSize = 4;
 constexpr size_t kMinimumProbeSize =
     kFixedHeaderSize + kProbeMagicSize + 1;
-constexpr size_t kMaximumProbeSize = 1200;
+constexpr size_t kMaximumProbeSize =
+    kFixedHeaderSize + static_cast<size_t>(UINT8_MAX);
 constexpr uint8_t kProbeMagic[kProbeMagicSize] = {'G', 'C', 'C', 'P'};
 
 uint16_t ReadUint16(const uint8_t* data) {
@@ -117,13 +118,10 @@ std::vector<uint8_t> BuildProbeRtpPacket(
     WriteUint16(packet.data() + 2, sequence);
     WriteUint32(packet.data() + 4, header.timestamp);
     WriteUint32(packet.data() + 8, header.ssrc);
-    const size_t padding_size = std::min(
-        size - kFixedHeaderSize,
-        static_cast<size_t>(UINT8_MAX));
-    const size_t padding_start = size - padding_size;
     std::copy(kProbeMagic, kProbeMagic + kProbeMagicSize,
-              packet.begin() + padding_start);
-    packet.back() = static_cast<uint8_t>(padding_size);
+              packet.begin() + kFixedHeaderSize);
+    packet.back() =
+        static_cast<uint8_t>(size - kFixedHeaderSize);
     return packet;
 }
 
@@ -134,14 +132,13 @@ bool IsProbeRtpPacket(const uint8_t* data, size_t size) {
     }
 
     const size_t padding_size = data[size - 1];
-    if (padding_size < kProbeMagicSize + 1U ||
-        padding_size > size - header.header_size) {
+    if (size - header.header_size != padding_size ||
+        padding_size < kProbeMagicSize + 1U) {
         return false;
     }
-    const size_t padding_start = size - padding_size;
     return std::equal(
         kProbeMagic, kProbeMagic + kProbeMagicSize,
-        data + padding_start);
+        data + header.header_size);
 }
 
 void MediaSequenceTranslator::OnProbe(uint16_t transport_sequence) {

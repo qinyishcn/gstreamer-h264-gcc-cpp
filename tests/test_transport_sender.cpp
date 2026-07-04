@@ -577,6 +577,60 @@ int TestStrictEgressCeilingSerializesAgedBacklog() {
     return EXIT_SUCCESS;
 }
 
+int TestPacingRateDecreaseReschedulesExistingDeadline() {
+    uint64_t now_us = 1U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        [&now_us]() { return now_us; }, 10000U);
+    sender.SetPacingRate(8000U);
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(1250U)));
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(1250U)));
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             static_cast<size_t>(2));
+    CHECK_TRUE(sender.SchedulePaced(ids[0]));
+    CHECK_TRUE(sender.SchedulePaced(ids[1]));
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+
+    sender.SetPacingRate(1000U);
+    now_us = 1251U;
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    now_us = 10001U;
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+    return EXIT_SUCCESS;
+}
+
+int TestPacingRateIncreaseReleasesOldDelay() {
+    uint64_t now_us = 1U;
+    gcc::TransportSender sender(
+        [](const uint8_t*, size_t) { return true; },
+        [&now_us]() { return now_us; }, 10000U);
+    sender.SetPacingRate(1000U);
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(1250U)));
+    CHECK_TRUE(sender.EnqueueMedia(MakePacket(1250U)));
+    std::vector<uint32_t> ids;
+    CHECK_EQ(sender.DrainIngress(
+                 [&ids](uint32_t id, size_t) {
+                     ids.push_back(id);
+                     return true;
+                 }),
+             static_cast<size_t>(2));
+    CHECK_TRUE(sender.SchedulePaced(ids[0]));
+    CHECK_TRUE(sender.SchedulePaced(ids[1]));
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+
+    sender.SetPacingRate(8000U);
+    now_us = 1250U;
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(0));
+    now_us = 1251U;
+    CHECK_EQ(sender.FlushPaced({}), static_cast<size_t>(1));
+    return EXIT_SUCCESS;
+}
+
 int TestCancelledProbeEpochNeverReachesWireOrHistory() {
     uint64_t now_us = 1000U;
     size_t datagrams = 0U;
@@ -960,6 +1014,9 @@ int main() {
     CHECK_EQ(TestReentrantPacerConsumptionIsAccepted(), EXIT_SUCCESS);
     CHECK_EQ(TestProbeAdmissionRequiresGccProbe(), EXIT_SUCCESS);
     CHECK_EQ(TestStrictEgressCeilingSerializesAgedBacklog(), EXIT_SUCCESS);
+    CHECK_EQ(TestPacingRateDecreaseReschedulesExistingDeadline(),
+             EXIT_SUCCESS);
+    CHECK_EQ(TestPacingRateIncreaseReleasesOldDelay(), EXIT_SUCCESS);
     CHECK_EQ(TestCancelledProbeEpochNeverReachesWireOrHistory(),
              EXIT_SUCCESS);
     CHECK_EQ(TestCancelledProbeBeforeVendorCallbackIsHarmless(),

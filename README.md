@@ -40,10 +40,14 @@ feedback 被重复消费；以及直接相减两台主机的 steady clock。当�
 - network target 上限为 8000 kbps，普通 pacing 上限为 9600 kbps。
 
 active probe 使用 17..267 字节的纯 RTP padding，与媒体共享 transport
-sequence。padding 字节预算严格按配置的 probe duration 计算，不再固定截断在
+sequence；padding count 覆盖 12 字节 RTP header 后的全部字节，不携带伪媒体
+payload。padding 字节预算严格按配置的 probe duration 计算，不再固定截断在
 100 ms；时间回拨返回零预算，极值计算会饱和而不溢出。默认首次倍率 2.0、后续
 倍率 1.5、发送 100 ms、成功阈值 0.75、失败后 5000 ms 重试、上限
 8000 kbps。
+
+C++ wire pacer 在运行中改变速率时，会按最后一个成功发送包的大小和发送时间
+重算下一发送时刻：降速立即服从新上限，升速也不会保留旧速率的额外等待。
 
 sender 与 demo 都支持：
 

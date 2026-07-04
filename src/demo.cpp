@@ -46,7 +46,7 @@ constexpr size_t kMaxFeedbackPerLoop = 64U;
 constexpr size_t kMaxControlEvents = 100000U;
 constexpr uint64_t kDrainTimeoutUs = UINT64_C(2000000);
 constexpr size_t kMinProbeBytes = 17U;
-constexpr size_t kMaxProbeBytes = 1200U;
+constexpr size_t kMaxProbeBytes = 267U;
 
 std::atomic<bool> running{true};
 std::atomic<uint64_t> frames{0U};

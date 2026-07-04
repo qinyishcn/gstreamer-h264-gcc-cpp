@@ -15,6 +15,14 @@ int main() {
     CHECK_TRUE(!razor_then_fallback.Evaluate(
         80U, 1800U, 50U, 102U, true, false).changed);
 
+    gcc::OuterLossBackoff disabled_rearm(200U);
+    CHECK_TRUE(disabled_rearm.Evaluate(
+        80U, 4000U, 50U, 100U, true).changed);
+    CHECK_TRUE(!disabled_rearm.Evaluate(
+        0U, 2000U, 50U, 101U, false).changed);
+    CHECK_TRUE(disabled_rearm.Evaluate(
+        80U, 2000U, 50U, 102U, true).changed);
+
     gcc::OuterLossBackoff backoff(200U);
     gcc::OuterLossDecision decision =
         backoff.Evaluate(26U, 4001U, 100U, 1000U, true);
@@ -28,8 +36,10 @@ int main() {
 
     CHECK_TRUE(!backoff.Evaluate(
         25U, 2001U, 500U, 1500U, false).changed);
-    CHECK_TRUE(!backoff.Evaluate(
-        26U, 2001U, 500U, 1500U, true).changed);
+    decision = backoff.Evaluate(
+        26U, 2001U, 500U, 1500U, true);
+    CHECK_TRUE(decision.changed);
+    CHECK_EQ(decision.proposed_kbps, static_cast<uint32_t>(1001));
     CHECK_TRUE(!backoff.Evaluate(
         25U, 2001U, 500U, 1750U, true).changed);
     decision = backoff.Evaluate(26U, 2001U, 500U, 1751U, true);
