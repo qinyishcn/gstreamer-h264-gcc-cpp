@@ -2,6 +2,14 @@
 
 基于 GStreamer C API 的 H.264 视频传输系统，集成 [razor](https://github.com/yuanrongxi/razor) GCC 拥塞控制算法。已在 GStreamer 1.16.3（Ubuntu 20.04）和 1.28.2（Ubuntu 24.04）上验证通过。
 
+## H.265 丢包恢复实验（独立 C++17 子项目）
+
+[h265-resilience](h265-resilience/README.md) 提供 H.265 UDP 收发、容错解码与上一帧保持、
+多 slice/短 GOP 周期恢复，以及两段 720p 素材、六种机制、七档丢包率的 252 组实测。
+查看 [PDF 报告](h265-resilience/results/report/H265_resilience_loss_psnr_report.pdf)、
+[结果说明](h265-resilience/results/report/H265_resilience_report.md) 和
+[逐帧/逐试验 CSV](h265-resilience/results/final/)。本子项目未接入 GCC，不改变原 H.264 行为。
+
 ## 🎯 项目简介
 
 本项目使用纯 C/C++ 实现，基于 GStreamer C API 构建视频传输管线：

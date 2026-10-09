@@ -1,0 +1,11 @@
+/build/
+/build-*/
+/data/
+*.y4m
+*.webm
+*.part
+*.log
+/results/*
+!/results/final/
+!/results/report/
+/results/final/examples/
